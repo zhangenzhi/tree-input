@@ -63,6 +63,9 @@ class ContinuousPE3D(nn.Module):
 def extract_pyramid_patches(images, levels, patch_size=16):
     """Extract multi-scale pyramid patches from a batch of images.
 
+    Vectorized: for each level, resize the whole image to (n*patch_size, n*patch_size)
+    then unfold into n*n patches. No per-patch loop.
+
     Args:
         images: [B, 3, H, W] tensor.
         levels: list of int, grid splits per side. e.g. [1, 2, 4, 8, 14].
@@ -75,25 +78,21 @@ def extract_pyramid_patches(images, levels, patch_size=16):
     all_patches = []
 
     for n in levels:
-        if n == H // patch_size:
-            # finest level: no resize needed, just unfold
-            p = images.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
-            # p: [B, C, n, n, patch_size, patch_size]
-            p = p.contiguous().view(B, C, n * n, patch_size, patch_size)
-            p = p.permute(0, 2, 1, 3, 4)  # [B, n*n, C, patch_size, patch_size]
+        target_size = n * patch_size
+        if target_size == H:
+            # finest level: no resize needed
+            resized = images
         else:
-            # split image into n x n grid, resize each to patch_size
-            cell_h = H // n
-            cell_w = W // n
-            patches_level = []
-            for row in range(n):
-                for col in range(n):
-                    crop = images[:, :, row*cell_h:(row+1)*cell_h, col*cell_w:(col+1)*cell_w]
-                    resized = F.interpolate(crop, size=(patch_size, patch_size), mode='bilinear', align_corners=False)
-                    patches_level.append(resized)
-            p = torch.stack(patches_level, dim=1)  # [B, n*n, C, patch_size, patch_size]
+            # resize whole image to (n*P, n*P), then unfold
+            resized = F.interpolate(images, size=(target_size, target_size), mode='bilinear', align_corners=False)
 
-        p = p.reshape(B, -1, C * patch_size * patch_size)  # [B, n*n, C*P*P]
+        # unfold into n x n patches of size [patch_size, patch_size]
+        # [B, C, n, patch_size, n, patch_size]
+        p = resized.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+        # p: [B, C, n, n, patch_size, patch_size]
+        p = p.contiguous().view(B, C, n * n, patch_size, patch_size)
+        p = p.permute(0, 2, 1, 3, 4)  # [B, n*n, C, patch_size, patch_size]
+        p = p.reshape(B, n * n, C * patch_size * patch_size)  # [B, n*n, C*P*P]
         all_patches.append(p)
 
     return torch.cat(all_patches, dim=1)  # [B, total_patches, C*P*P]

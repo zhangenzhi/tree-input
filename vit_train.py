@@ -120,12 +120,14 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    total_steps = args.num_epochs * len(dataloaders["train"])
-    warmup_steps = args.warmup_epochs * len(dataloaders["train"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-4, total_iters=warmup_steps)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.num_epochs - args.warmup_epochs
+    )
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-4, total_iters=args.warmup_epochs
+    )
     lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, scheduler], milestones=[warmup_steps]
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_epochs]
     )
 
     scaler = GradScaler()
