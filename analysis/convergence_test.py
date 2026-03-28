@@ -54,8 +54,8 @@ def get_cifar10(batch_size=64):
     train_set = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
     val_set = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_val)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
     return train_loader, val_loader
 
 
@@ -256,11 +256,13 @@ def validate(model, loader, criterion, device):
     return total_loss / total, 100.0 * correct / total
 
 
-def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5):
+def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5, skip_vit=False):
     device = get_device()
     print(f"Device: {device}")
     print(f"Epochs: {num_epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"Attention probe every {attn_probe_interval} epochs")
+    if skip_vit:
+        print("Skipping ViT-Tiny (--skip_vit)")
     print()
 
     train_loader, val_loader = get_cifar10(batch_size)
@@ -272,7 +274,11 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5
 
     results = {}
 
-    for name, model_fn in [("ViT-Tiny", ViTTiny), ("HiT-Tiny", HiTTiny)]:
+    models_to_run = [("ViT-Tiny", ViTTiny), ("HiT-Tiny", HiTTiny)]
+    if skip_vit:
+        models_to_run = [("HiT-Tiny", HiTTiny)]
+
+    for name, model_fn in models_to_run:
         print(f"{'='*60}")
         print(f"Training {name}...")
         print(f"{'='*60}")
@@ -425,4 +431,18 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5
 
 
 if __name__ == "__main__":
-    run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--attn_probe_interval", type=int, default=5)
+    parser.add_argument("--skip_vit", action="store_true", help="Skip ViT-Tiny, only run HiT-Tiny")
+    args = parser.parse_args()
+    run_experiment(
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        attn_probe_interval=args.attn_probe_interval,
+        skip_vit=args.skip_vit,
+    )
