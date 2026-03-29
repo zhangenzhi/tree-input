@@ -1,19 +1,8 @@
 """
 Verify whether cross-level attention bias exists at initialization (epoch 0).
 
-This script:
-1. Creates a randomly initialized HiT-B model
-2. Feeds random images (or real images if available) through the first transformer block
-3. Extracts the attention map from layer 0
-4. Computes average attention weight for:
-   - intra-level pairs (same pyramid level)
-   - cross-level parent-child pairs (adjacent levels)
-   - cross-level distant pairs (non-adjacent levels)
-5. Plots the attention heatmap and prints statistics
-
-If cross-level attention is significantly higher than intra-level at init,
-the "structural similarity biases training" hypothesis has support.
-If attention is roughly uniform, the hypothesis lacks foundation.
+Tests both HiT-Tiny (embed_dim=192) and HiT-B (embed_dim=768) to examine
+how embedding dimension affects structural attention bias.
 
 Runs on CPU, no GPU needed.
 """
@@ -23,10 +12,12 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from model.hit import HiTBase, extract_pyramid_patches, build_pyramid_coords
+import timm
+from model.hit import extract_pyramid_patches, build_pyramid_coords, ContinuousPE3D
 
 
 LEVELS = [1, 2, 4, 8, 14]
@@ -35,9 +26,6 @@ IMAGE_SIZE = 224
 
 
 def get_level_ranges(levels):
-    """Return (start, end) index for each level in the token sequence.
-    Index 0 is CLS token, patches start at index 1.
-    """
     ranges = {}
     offset = 1  # skip CLS
     for lvl_idx, n in enumerate(levels):
@@ -48,9 +36,6 @@ def get_level_ranges(levels):
 
 
 def get_parent_child_pairs(levels):
-    """Return set of (parent_patch_idx, child_patch_idx) pairs.
-    Indices are global patch indices (0-based, before adding CLS offset).
-    """
     pairs = set()
     offset = {}
     idx = 0
@@ -62,7 +47,6 @@ def get_parent_child_pairs(levels):
         parent_n = levels[lvl_idx]
         child_n = levels[lvl_idx + 1]
         ratio = child_n // parent_n
-
         for pr in range(parent_n):
             for pc in range(parent_n):
                 parent_idx = offset[lvl_idx] + pr * parent_n + pc
@@ -76,13 +60,56 @@ def get_parent_child_pairs(levels):
     return pairs
 
 
+# ---- HiT-Tiny model (matching convergence_test.py) ----
+
+class HiTTiny(nn.Module):
+    def __init__(self, num_classes=10, levels=None):
+        super().__init__()
+        self.levels = levels or LEVELS
+        self.total_patches = sum(n * n for n in self.levels)
+        self.patch_size = 16
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim  # 192
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        coords = build_pyramid_coords(self.levels)
+        self.register_buffer("pyramid_coords", coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def forward(self, images):
+        B = images.size(0)
+        patches = extract_pyramid_patches(images, self.levels, self.patch_size)
+        x = self.patch_proj(patches)
+        pe = self.pe(self.pyramid_coords)
+        x = x + pe.unsqueeze(0)
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
+# ---- HiT-B model (from model/hit.py) ----
+
+from model.hit import HiTBase
+
+
+# ---- Attention extraction (works for both Tiny and Base) ----
+
 def extract_attention(model, images):
-    """Run forward through patch embedding + first transformer block,
-    return attention weights from layer 0.
-    """
+    """Extract layer 0 attention logits and probs."""
     B = images.size(0)
 
-    # Patch extraction and projection (same as HiTBase.forward)
     patches = extract_pyramid_patches(images, model.levels, model.patch_size)
     x = model.patch_proj(patches)
     pe = model.pe(model.pyramid_coords)
@@ -91,44 +118,95 @@ def extract_attention(model, images):
     x = torch.cat([cls_tokens, x], dim=1)
     x = model.pos_drop(x)
 
-    # Extract attention from first block
     block = model.blocks[0]
     y = block.norm1(x)
-
-    # timm's Attention module
     attn_module = block.attn
     B, N, C = y.shape
     qkv = attn_module.qkv(y).reshape(B, N, 3, attn_module.num_heads, C // attn_module.num_heads)
-    qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, heads, N, head_dim]
+    qkv = qkv.permute(2, 0, 3, 1, 4)
     q, k, v = qkv.unbind(0)
-
     scale = (C // attn_module.num_heads) ** -0.5
-    attn_weights = (q @ k.transpose(-2, -1)) * scale  # [B, heads, N, N]
-    attn_probs = attn_weights.softmax(dim=-1)
+    attn_logits = (q @ k.transpose(-2, -1)) * scale
+    attn_probs = attn_logits.softmax(dim=-1)
 
-    return attn_weights.detach(), attn_probs.detach()
+    return attn_logits.detach(), attn_probs.detach()
+
+
+def compute_stats(avg_logits, avg_probs, levels):
+    """Compute attention stats by category."""
+    level_ranges = get_level_ranges(levels)
+    parent_child_pairs = get_parent_child_pairs(levels)
+    total_patches = sum(n * n for n in levels)
+    N = 1 + total_patches
+
+    pc_set = set()
+    for (pi, ci) in parent_child_pairs:
+        pc_set.add((pi + 1, ci + 1))
+        pc_set.add((ci + 1, pi + 1))
+
+    intra_logits, pc_logits, other_logits = [], [], []
+    intra_probs, pc_probs, other_probs = [], [], []
+
+    for i in range(1, N):
+        i_level = None
+        for lvl, (s, e) in level_ranges.items():
+            if s <= i < e:
+                i_level = lvl
+                break
+        for j in range(1, N):
+            if i == j:
+                continue
+            j_level = None
+            for lvl, (s, e) in level_ranges.items():
+                if s <= j < e:
+                    j_level = lvl
+                    break
+
+            if i_level == j_level:
+                intra_logits.append(avg_logits[i, j])
+                intra_probs.append(avg_probs[i, j])
+            elif (i, j) in pc_set:
+                pc_logits.append(avg_logits[i, j])
+                pc_probs.append(avg_probs[i, j])
+            else:
+                other_logits.append(avg_logits[i, j])
+                other_probs.append(avg_probs[i, j])
+
+    return {
+        "intra_logits": (np.mean(intra_logits), np.std(intra_logits), len(intra_logits)),
+        "pc_logits": (np.mean(pc_logits), np.std(pc_logits), len(pc_logits)),
+        "other_logits": (np.mean(other_logits), np.std(other_logits), len(other_logits)),
+        "intra_probs": (np.mean(intra_probs), np.std(intra_probs)),
+        "pc_probs": (np.mean(pc_probs), np.std(pc_probs)),
+        "other_probs": (np.mean(other_probs), np.std(other_probs)),
+        "uniform": 1.0 / N,
+        "ratio": np.mean(pc_probs) / np.mean(intra_probs),
+    }
+
+
+def print_stats(name, stats):
+    print(f"--- {name} ---")
+    print(f"  Attention LOGITS:")
+    print(f"    Intra-level:        mean={stats['intra_logits'][0]:.6f}  std={stats['intra_logits'][1]:.6f}  n={stats['intra_logits'][2]}")
+    print(f"    Parent-child:       mean={stats['pc_logits'][0]:.6f}  std={stats['pc_logits'][1]:.6f}  n={stats['pc_logits'][2]}")
+    print(f"    Cross-other:        mean={stats['other_logits'][0]:.6f}  std={stats['other_logits'][1]:.6f}  n={stats['other_logits'][2]}")
+    print(f"  Attention PROBS:")
+    print(f"    Uniform baseline:   {stats['uniform']:.6f}")
+    print(f"    Intra-level:        mean={stats['intra_probs'][0]:.6f}  std={stats['intra_probs'][1]:.6f}")
+    print(f"    Parent-child:       mean={stats['pc_probs'][0]:.6f}  std={stats['pc_probs'][1]:.6f}")
+    print(f"    Cross-other:        mean={stats['other_probs'][0]:.6f}  std={stats['other_probs'][1]:.6f}")
+    print(f"  PC / Intra ratio:     {stats['ratio']:.4f}")
+    print()
 
 
 def analyze():
     print("=" * 60)
-    print("HiT-B Attention at Initialization Analysis")
+    print("HiT Attention at Initialization: Tiny vs Base")
     print("=" * 60)
     print(f"Levels: {LEVELS}, Total patches: {sum(n*n for n in LEVELS)}")
-    print(f"Sequence length: 1 (CLS) + {sum(n*n for n in LEVELS)} = {1 + sum(n*n for n in LEVELS)}")
     print()
 
-    # Create model (random init)
-    torch.manual_seed(42)
-    model = HiTBase(
-        image_size=IMAGE_SIZE,
-        patch_size=PATCH_SIZE,
-        num_classes=1000,
-        levels=LEVELS,
-        pretrained=False,
-    )
-    model.eval()
-
-    # Use real CIFAR-10 images resized to 224x224
+    # Load CIFAR-10 images
     from torchvision import datasets, transforms
     transform = transforms.Compose([
         transforms.Resize(IMAGE_SIZE),
@@ -141,188 +219,106 @@ def analyze():
     print(f"Input: CIFAR-10 images, batch={images.shape}")
     print()
 
+    all_stats = {}
+
+    # ---- HiT-Tiny (embed_dim=192) ----
+    torch.manual_seed(42)
+    hit_tiny = HiTTiny(num_classes=10)
+    hit_tiny.eval()
+    print(f"HiT-Tiny: embed_dim={hit_tiny.embed_dim}, params={sum(p.numel() for p in hit_tiny.parameters()):,}")
+
     with torch.no_grad():
-        attn_logits, attn_probs = extract_attention(model, images)
+        logits_t, probs_t = extract_attention(hit_tiny, images)
+    avg_logits_t = logits_t.mean(dim=(0, 1)).numpy()
+    avg_probs_t = probs_t.mean(dim=(0, 1)).numpy()
+    stats_t = compute_stats(avg_logits_t, avg_probs_t, LEVELS)
+    print_stats("HiT-Tiny (embed_dim=192)", stats_t)
+    all_stats["HiT-Tiny"] = stats_t
 
-    # Average over batch and heads: [N, N]
-    avg_logits = attn_logits.mean(dim=(0, 1)).numpy()
-    avg_probs = attn_probs.mean(dim=(0, 1)).numpy()
+    # ---- HiT-B (embed_dim=768) ----
+    torch.manual_seed(42)
+    hit_b = HiTBase(
+        image_size=IMAGE_SIZE,
+        patch_size=PATCH_SIZE,
+        num_classes=1000,
+        levels=LEVELS,
+        pretrained=False,
+    )
+    hit_b.eval()
+    print(f"HiT-B: embed_dim={hit_b.embed_dim}, params={sum(p.numel() for p in hit_b.parameters()):,}")
 
-    # Compute statistics by region
-    level_ranges = get_level_ranges(LEVELS)
-    parent_child_pairs = get_parent_child_pairs(LEVELS)
-    total_patches = sum(n * n for n in LEVELS)
-    N = 1 + total_patches  # including CLS
-
-    # Collect attention values
-    intra_level_logits = []
-    cross_parent_child_logits = []
-    cross_other_logits = []
-    intra_level_probs = []
-    cross_parent_child_probs = []
-    cross_other_probs = []
-
-    # Build parent-child lookup with CLS offset (+1)
-    pc_set = set()
-    for (pi, ci) in parent_child_pairs:
-        pc_set.add((pi + 1, ci + 1))
-        pc_set.add((ci + 1, pi + 1))  # symmetric
-
-    for i in range(1, N):  # skip CLS as query for cleaner analysis
-        for j in range(1, N):
-            if i == j:
-                continue
-            # Determine if same level
-            i_level = None
-            j_level = None
-            for lvl, (s, e) in level_ranges.items():
-                if s <= i < e:
-                    i_level = lvl
-                if s <= j < e:
-                    j_level = lvl
-
-            logit_val = avg_logits[i, j]
-            prob_val = avg_probs[i, j]
-
-            if i_level == j_level:
-                intra_level_logits.append(logit_val)
-                intra_level_probs.append(prob_val)
-            elif (i, j) in pc_set:
-                cross_parent_child_logits.append(logit_val)
-                cross_parent_child_probs.append(prob_val)
-            else:
-                cross_other_logits.append(logit_val)
-                cross_other_probs.append(prob_val)
-
-    uniform_prob = 1.0 / N
-
-    print("--- Attention LOGITS (before softmax) ---")
-    print(f"  Intra-level:          mean={np.mean(intra_level_logits):.6f}  std={np.std(intra_level_logits):.6f}  n={len(intra_level_logits)}")
-    print(f"  Cross parent-child:   mean={np.mean(cross_parent_child_logits):.6f}  std={np.std(cross_parent_child_logits):.6f}  n={len(cross_parent_child_logits)}")
-    print(f"  Cross other:          mean={np.mean(cross_other_logits):.6f}  std={np.std(cross_other_logits):.6f}  n={len(cross_other_logits)}")
-    print()
-    print("--- Attention PROBABILITIES (after softmax) ---")
-    print(f"  Uniform baseline:     {uniform_prob:.6f}")
-    print(f"  Intra-level:          mean={np.mean(intra_level_probs):.6f}  std={np.std(intra_level_probs):.6f}")
-    print(f"  Cross parent-child:   mean={np.mean(cross_parent_child_probs):.6f}  std={np.std(cross_parent_child_probs):.6f}")
-    print(f"  Cross other:          mean={np.mean(cross_other_probs):.6f}  std={np.std(cross_other_probs):.6f}")
-    print()
-
-    # Ratio: how much larger is parent-child vs intra-level?
-    ratio = np.mean(cross_parent_child_probs) / np.mean(intra_level_probs)
-    print(f"  Parent-child / Intra-level ratio: {ratio:.4f}")
-    print(f"  (ratio=1.0 means no bias; >1.0 means cross-level bias exists)")
-    print()
-
-    # Also compare with standard ViT baseline attention
-    print("--- For reference: Standard ViT-B (no pyramid) ---")
-    import timm
-    vit = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=1000)
-    vit.eval()
     with torch.no_grad():
-        # Get attention from ViT layer 0
-        vit_x = vit.patch_embed(images)
-        vit_cls = vit.cls_token.expand(images.size(0), -1, -1)
-        vit_x = torch.cat([vit_cls, vit_x], dim=1)
-        vit_x = vit_x + vit.pos_embed
-        vit_x = vit.pos_drop(vit_x)
-
-        vit_block = vit.blocks[0]
-        vit_y = vit_block.norm1(vit_x)
-        vit_attn = vit_block.attn
-        B2, N2, C2 = vit_y.shape
-        qkv2 = vit_attn.qkv(vit_y).reshape(B2, N2, 3, vit_attn.num_heads, C2 // vit_attn.num_heads)
-        qkv2 = qkv2.permute(2, 0, 3, 1, 4)
-        q2, k2, v2 = qkv2.unbind(0)
-        scale2 = (C2 // vit_attn.num_heads) ** -0.5
-        vit_attn_probs = (q2 @ k2.transpose(-2, -1) * scale2).softmax(dim=-1)
-        vit_avg_probs = vit_attn_probs.mean(dim=(0, 1)).numpy()
-
-    vit_uniform = 1.0 / N2
-    # Adjacent patches (horizontal neighbors) vs distant
-    vit_adjacent = []
-    vit_distant = []
-    grid = 14
-    for i in range(1, N2):
-        for j in range(1, N2):
-            if i == j:
-                continue
-            ri, ci_ = (i - 1) // grid, (i - 1) % grid
-            rj, cj = (j - 1) // grid, (j - 1) % grid
-            dist = abs(ri - rj) + abs(ci_ - cj)
-            if dist == 1:
-                vit_adjacent.append(vit_avg_probs[i, j])
-            elif dist > 5:
-                vit_distant.append(vit_avg_probs[i, j])
-
-    print(f"  Uniform baseline:     {vit_uniform:.6f}")
-    print(f"  Adjacent (dist=1):    mean={np.mean(vit_adjacent):.6f}  std={np.std(vit_adjacent):.6f}")
-    print(f"  Distant (dist>5):     mean={np.mean(vit_distant):.6f}  std={np.std(vit_distant):.6f}")
-    print(f"  Adjacent / Distant:   {np.mean(vit_adjacent) / np.mean(vit_distant):.4f}")
-    print()
+        logits_b, probs_b = extract_attention(hit_b, images)
+    avg_logits_b = logits_b.mean(dim=(0, 1)).numpy()
+    avg_probs_b = probs_b.mean(dim=(0, 1)).numpy()
+    stats_b = compute_stats(avg_logits_b, avg_probs_b, LEVELS)
+    print_stats("HiT-B (embed_dim=768)", stats_b)
+    all_stats["HiT-B"] = stats_b
 
     # ---- Plots ----
-    os.makedirs(os.path.join(os.path.dirname(__file__), "figures"), exist_ok=True)
     fig_dir = os.path.join(os.path.dirname(__file__), "figures")
+    os.makedirs(fig_dir, exist_ok=True)
 
-    # 1. Full attention heatmap
+    # 1. Attention heatmaps side by side
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 
-    im0 = axes[0].imshow(avg_probs, cmap="viridis", aspect="auto")
-    axes[0].set_title("HiT-B: Attention Probs (Layer 0, avg over batch & heads)")
-    axes[0].set_xlabel("Key token")
-    axes[0].set_ylabel("Query token")
-    # Draw level boundaries
     boundaries = [0]
     for n in LEVELS:
         boundaries.append(boundaries[-1] + n * n)
-    boundaries = [b + 1 for b in boundaries]  # +1 for CLS
-    for b in boundaries:
-        axes[0].axhline(y=b - 0.5, color="red", linewidth=0.5, alpha=0.7)
-        axes[0].axvline(x=b - 0.5, color="red", linewidth=0.5, alpha=0.7)
-    plt.colorbar(im0, ax=axes[0])
+    boundaries = [b + 1 for b in boundaries]
 
-    im1 = axes[1].imshow(vit_avg_probs, cmap="viridis", aspect="auto")
-    axes[1].set_title("ViT-B: Attention Probs (Layer 0, avg over batch & heads)")
-    axes[1].set_xlabel("Key token")
-    axes[1].set_ylabel("Query token")
-    plt.colorbar(im1, ax=axes[1])
+    for ax, avg_probs, title in [
+        (axes[0], avg_probs_t, f"HiT-Tiny (dim=192, ratio={stats_t['ratio']:.3f})"),
+        (axes[1], avg_probs_b, f"HiT-B (dim=768, ratio={stats_b['ratio']:.3f})"),
+    ]:
+        im = ax.imshow(avg_probs, cmap="viridis", aspect="auto")
+        ax.set_title(title)
+        ax.set_xlabel("Key token")
+        ax.set_ylabel("Query token")
+        for b in boundaries:
+            ax.axhline(y=b - 0.5, color="red", linewidth=0.5, alpha=0.7)
+            ax.axvline(x=b - 0.5, color="red", linewidth=0.5, alpha=0.7)
+        plt.colorbar(im, ax=ax)
 
+    plt.suptitle("Attention at Initialization: Tiny vs Base (CIFAR-10)", fontsize=14)
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "attention_heatmap_init.png"), dpi=150)
-    print(f"Saved: {fig_dir}/attention_heatmap_init.png")
+    plt.savefig(os.path.join(fig_dir, "attention_heatmap_tiny_vs_base.png"), dpi=150)
+    print(f"Saved: {fig_dir}/attention_heatmap_tiny_vs_base.png")
 
-    # 2. Box plot comparison
-    fig, ax = plt.subplots(figsize=(8, 5))
-    data = [intra_level_probs, cross_parent_child_probs, cross_other_probs]
-    labels = ["Intra-level", "Parent-Child", "Cross-other"]
-    bp = ax.boxplot(data, labels=labels, showfliers=False, patch_artist=True)
-    colors = ["#4C72B0", "#DD8452", "#55A868"]
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.7)
-    ax.axhline(y=uniform_prob, color="red", linestyle="--", label=f"Uniform={uniform_prob:.5f}")
-    ax.set_ylabel("Attention Probability")
-    ax.set_title("HiT-B Layer 0 Attention Distribution at Initialization")
+    # 2. Bar chart comparison
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(3)
+    width = 0.35
+    tiny_vals = [stats_t["intra_probs"][0], stats_t["pc_probs"][0], stats_t["other_probs"][0]]
+    base_vals = [stats_b["intra_probs"][0], stats_b["pc_probs"][0], stats_b["other_probs"][0]]
+    ax.bar(x - width/2, tiny_vals, width, label=f"HiT-Tiny (ratio={stats_t['ratio']:.3f})", color="#DD8452")
+    ax.bar(x + width/2, base_vals, width, label=f"HiT-B (ratio={stats_b['ratio']:.3f})", color="#4C72B0")
+    ax.axhline(y=stats_t["uniform"], color="red", linestyle="--", alpha=0.5, label="Uniform")
+    ax.set_xticks(x)
+    ax.set_xticklabels(["Intra-level", "Parent-child", "Cross-other"])
+    ax.set_ylabel("Mean Attention Probability")
+    ax.set_title("Structural Attention Bias: Effect of Embedding Dimension")
     ax.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "attention_boxplot_init.png"), dpi=150)
-    print(f"Saved: {fig_dir}/attention_boxplot_init.png")
+    plt.savefig(os.path.join(fig_dir, "attention_bar_tiny_vs_base.png"), dpi=150)
+    print(f"Saved: {fig_dir}/attention_bar_tiny_vs_base.png")
 
+    # ---- Summary ----
     print()
     print("=" * 60)
-    print("CONCLUSION:")
-    if ratio > 1.05:
-        print(f"  Cross-level parent-child attention is {ratio:.2f}x higher than intra-level.")
-        print("  -> Structural similarity bias EXISTS at initialization.")
-        print("  -> The hypothesis has empirical support.")
-    elif ratio > 0.95:
-        print(f"  Cross-level parent-child attention is ~equal to intra-level (ratio={ratio:.2f}).")
-        print("  -> Attention is roughly UNIFORM at initialization.")
-        print("  -> The structural bias hypothesis LACKS support.")
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"  {'Model':15s} | embed_dim | PC/Intra ratio")
+    print(f"  {'-'*15} | {'-'*9} | {'-'*14}")
+    for name, stats in all_stats.items():
+        dim = 192 if "Tiny" in name else 768
+        print(f"  {name:15s} | {dim:9d} | {stats['ratio']:.4f}")
+    print()
+    if stats_t["ratio"] > stats_b["ratio"] * 1.1:
+        print("  -> Structural bias is STRONGER in smaller models.")
+        print("  -> Higher embed_dim dilutes pixel-space correlations more effectively.")
     else:
-        print(f"  Cross-level parent-child attention is LOWER than intra-level (ratio={ratio:.2f}).")
-        print("  -> No structural bias detected.")
+        print("  -> No significant difference between model sizes.")
     print("=" * 60)
 
 
