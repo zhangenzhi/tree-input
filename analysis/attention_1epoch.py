@@ -1,11 +1,7 @@
 """
-Verify: does 1 epoch of training create cross-level attention bias?
+Track cross-level attention bias emergence during early training.
 
-Probes HiT-Tiny attention at:
-  - Step 0: before any training (true initialization)
-  - Step 0: after first batch (1 gradient update)
-  - End of epoch 1: after full epoch
-
+Probes HiT-Tiny attention every 50 steps for 5 epochs.
 Runs on MPS/CPU.
 """
 
@@ -183,49 +179,72 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
 
+    num_epochs = 5
+    probe_interval = 50
+    total_steps_per_epoch = len(train_loader)
+
     print("=" * 60)
-    print("HiT-Tiny Attention Bias: Init -> 1 Epoch")
+    print(f"HiT-Tiny Attention Bias: 5 epochs, probe every {probe_interval} steps")
+    print(f"Steps per epoch: {total_steps_per_epoch}")
     print("=" * 60)
     print()
 
-    # Probe: true initialization (before any training)
+    # Probe: true initialization
     model.eval()
     with torch.no_grad():
         probs = extract_attention(model, probe_images.to(device))
     ratio, intra, pc = compute_ratio(probs, LEVELS)
-    print(f"  [Before training]  ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}")
+    print(f"  [init          ]  ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}")
 
-    # Train step by step for first few batches, then rest of epoch
-    model.train()
-    steps_to_probe = [1, 5, 10, 50, 100]
-    probe_idx = 0
-    total_steps = len(train_loader)
+    history = [{"global_step": 0, "epoch": 0, "ratio": ratio, "intra": intra, "pc": pc}]
 
-    for step, (images, labels) in enumerate(train_loader):
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+    global_step = 0
+    for epoch in range(num_epochs):
+        model.train()
+        for step, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            global_step += 1
 
-        if probe_idx < len(steps_to_probe) and (step + 1) == steps_to_probe[probe_idx]:
-            model.eval()
-            with torch.no_grad():
-                probs = extract_attention(model, probe_images.to(device))
-            ratio, intra, pc = compute_ratio(probs, LEVELS)
-            print(f"  [After step {step+1:4d}/{total_steps}]  ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}  loss={loss.item():.4f}")
-            model.train()
-            probe_idx += 1
+            if global_step % probe_interval == 0:
+                model.eval()
+                with torch.no_grad():
+                    probs = extract_attention(model, probe_images.to(device))
+                ratio, intra, pc = compute_ratio(probs, LEVELS)
+                print(f"  [ep{epoch+1} step {step+1:4d}/{total_steps_per_epoch}  gs={global_step:5d}]  ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}  loss={loss.item():.4f}")
+                history.append({"global_step": global_step, "epoch": epoch + 1, "ratio": ratio, "intra": intra, "pc": pc})
+                model.train()
 
-    # Probe: end of epoch 1
-    model.eval()
-    with torch.no_grad():
-        probs = extract_attention(model, probe_images.to(device))
-    ratio, intra, pc = compute_ratio(probs, LEVELS)
-    print(f"  [After epoch 1]    ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}")
+    # Plot
+    import matplotlib.pyplot as plt
+    fig_dir = os.path.join(os.path.dirname(__file__), "figures")
+    os.makedirs(fig_dir, exist_ok=True)
 
-    print()
+    steps = [h["global_step"] for h in history]
+    ratios = [h["ratio"] for h in history]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(steps, ratios, marker="o", markersize=3, linewidth=1.5)
+    ax.axhline(y=1.0, color="red", linestyle="--", alpha=0.5, label="No bias (1.0)")
+    for ep in range(1, num_epochs + 1):
+        ax.axvline(x=ep * total_steps_per_epoch, color="gray", linestyle=":", alpha=0.4)
+        ax.text(ep * total_steps_per_epoch, ax.get_ylim()[1] * 0.95, f"ep{ep}", ha="center", fontsize=8, color="gray")
+    ax.set_xlabel("Global Step")
+    ax.set_ylabel("Parent-Child / Intra-Level Ratio")
+    ax.set_title("HiT-Tiny: Cross-Level Attention Bias Over 5 Epochs")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "attention_bias_5ep.png"), dpi=150)
+    print(f"\nSaved: {fig_dir}/attention_bias_5ep.png")
+
+    # Find peak
+    peak = max(history, key=lambda h: h["ratio"])
+    print(f"\nPeak ratio: {peak['ratio']:.4f} at global_step={peak['global_step']} (epoch {peak['epoch']})")
     print("=" * 60)
 
 
