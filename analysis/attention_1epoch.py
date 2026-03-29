@@ -179,13 +179,21 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)
 
-    num_epochs = 5
+    num_epochs = 100
     probe_interval = 50
     total_steps_per_epoch = len(train_loader)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    # Logging
+    import json
+    fig_dir = os.path.join(os.path.dirname(__file__), "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+    log_path = os.path.join(fig_dir, "attention_ratio_100ep.json")
 
     print("=" * 60)
-    print(f"HiT-Tiny Attention Bias: 5 epochs, probe every {probe_interval} steps")
+    print(f"HiT-Tiny Attention Bias: {num_epochs} epochs, probe every {probe_interval} steps")
     print(f"Steps per epoch: {total_steps_per_epoch}")
+    print(f"Log: {log_path}")
     print("=" * 60)
     print()
 
@@ -201,6 +209,10 @@ def main():
     global_step = 0
     for epoch in range(num_epochs):
         model.train()
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_total = 0
+
         for step, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -210,41 +222,69 @@ def main():
             optimizer.step()
             global_step += 1
 
+            epoch_loss += loss.item() * labels.size(0)
+            _, predicted = outputs.max(1)
+            epoch_correct += predicted.eq(labels).sum().item()
+            epoch_total += labels.size(0)
+
             if global_step % probe_interval == 0:
                 model.eval()
                 with torch.no_grad():
                     probs = extract_attention(model, probe_images.to(device))
                 ratio, intra, pc = compute_ratio(probs, LEVELS)
-                print(f"  [ep{epoch+1} step {step+1:4d}/{total_steps_per_epoch}  gs={global_step:5d}]  ratio={ratio:.4f}  intra={intra:.6f}  pc={pc:.6f}  loss={loss.item():.4f}")
                 history.append({"global_step": global_step, "epoch": epoch + 1, "ratio": ratio, "intra": intra, "pc": pc})
                 model.train()
 
+        cosine_scheduler.step()
+
+        # Print epoch summary
+        train_loss = epoch_loss / epoch_total
+        train_acc = 100.0 * epoch_correct / epoch_total
+        last_ratio = history[-1]["ratio"]
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1:3d}/{num_epochs} | "
+                  f"loss={train_loss:.4f} acc={train_acc:.1f}% | "
+                  f"ratio={last_ratio:.4f} lr={optimizer.param_groups[0]['lr']:.6f}")
+
+    # Save history
+    with open(log_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"\nSaved: {log_path} ({len(history)} entries)")
+
     # Plot
     import matplotlib.pyplot as plt
-    fig_dir = os.path.join(os.path.dirname(__file__), "figures")
-    os.makedirs(fig_dir, exist_ok=True)
-
     steps = [h["global_step"] for h in history]
     ratios = [h["ratio"] for h in history]
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(steps, ratios, marker="o", markersize=3, linewidth=1.5)
+    fig, ax = plt.subplots(figsize=(16, 5))
+    ax.plot(steps, ratios, linewidth=0.8, alpha=0.6, label="raw (per 50 steps)")
+
+    # Smoothed curve (moving average)
+    window = 20
+    if len(ratios) > window:
+        smoothed = np.convolve(ratios, np.ones(window)/window, mode="valid")
+        smoothed_steps = steps[window-1:]
+        ax.plot(smoothed_steps, smoothed, linewidth=2, color="darkorange", label=f"smoothed (MA-{window})")
+
     ax.axhline(y=1.0, color="red", linestyle="--", alpha=0.5, label="No bias (1.0)")
-    for ep in range(1, num_epochs + 1):
-        ax.axvline(x=ep * total_steps_per_epoch, color="gray", linestyle=":", alpha=0.4)
-        ax.text(ep * total_steps_per_epoch, ax.get_ylim()[1] * 0.95, f"ep{ep}", ha="center", fontsize=8, color="gray")
+    for ep in [1, 5, 10, 20, 50, 100]:
+        if ep <= num_epochs:
+            ax.axvline(x=ep * total_steps_per_epoch, color="gray", linestyle=":", alpha=0.3)
+            ax.text(ep * total_steps_per_epoch, ax.get_ylim()[0], f"ep{ep}", ha="center", fontsize=7, color="gray")
     ax.set_xlabel("Global Step")
     ax.set_ylabel("Parent-Child / Intra-Level Ratio")
-    ax.set_title("HiT-Tiny: Cross-Level Attention Bias Over 5 Epochs")
+    ax.set_title(f"HiT-Tiny: Cross-Level Attention Bias Over {num_epochs} Epochs")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "attention_bias_5ep.png"), dpi=150)
-    print(f"\nSaved: {fig_dir}/attention_bias_5ep.png")
+    plt.savefig(os.path.join(fig_dir, "attention_bias_100ep.png"), dpi=150)
+    print(f"Saved: {fig_dir}/attention_bias_100ep.png")
 
-    # Find peak
+    # Summary
     peak = max(history, key=lambda h: h["ratio"])
-    print(f"\nPeak ratio: {peak['ratio']:.4f} at global_step={peak['global_step']} (epoch {peak['epoch']})")
+    final_avg = np.mean([h["ratio"] for h in history[-20:]])
+    print(f"\nPeak ratio: {peak['ratio']:.4f} at gs={peak['global_step']} (epoch {peak['epoch']})")
+    print(f"Final avg ratio (last 20 probes): {final_avg:.4f}")
     print("=" * 60)
 
 
