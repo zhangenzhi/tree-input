@@ -352,6 +352,8 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5
     epochs = range(1, num_epochs + 1)
 
     for name in ["ViT-Tiny", "HiT-Tiny"]:
+        if name not in results:
+            continue
         hist = results[name]
         axes[0, 0].plot(epochs, hist["train_loss"], label=name, linewidth=1.5)
         axes[0, 1].plot(epochs, hist["val_loss"], label=name, linewidth=1.5)
@@ -411,6 +413,8 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5
     print("SUMMARY")
     print("=" * 60)
     for name in ["ViT-Tiny", "HiT-Tiny"]:
+        if name not in results:
+            continue
         hist = results[name]
         best_val = max(hist["val_acc"])
         best_epoch = hist["val_acc"].index(best_val) + 1

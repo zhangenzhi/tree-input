@@ -128,9 +128,18 @@ def analyze():
     )
     model.eval()
 
-    # Random images (simulating real input distribution)
-    torch.manual_seed(123)
-    images = torch.randn(4, 3, IMAGE_SIZE, IMAGE_SIZE)
+    # Use real CIFAR-10 images resized to 224x224
+    from torchvision import datasets, transforms
+    transform = transforms.Compose([
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    cifar = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    loader = torch.utils.data.DataLoader(cifar, batch_size=16, shuffle=False)
+    images, _ = next(iter(loader))
+    print(f"Input: CIFAR-10 images, batch={images.shape}")
+    print()
 
     with torch.no_grad():
         attn_logits, attn_probs = extract_attention(model, images)
