@@ -222,7 +222,7 @@ def analyze():
     with torch.no_grad():
         # Get attention from ViT layer 0
         vit_x = vit.patch_embed(images)
-        vit_cls = vit.cls_token.expand(4, -1, -1)
+        vit_cls = vit.cls_token.expand(images.size(0), -1, -1)
         vit_x = torch.cat([vit_cls, vit_x], dim=1)
         vit_x = vit_x + vit.pos_embed
         vit_x = vit.pos_drop(vit_x)
