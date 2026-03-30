@@ -256,13 +256,15 @@ def validate(model, loader, criterion, device):
     return total_loss / total, 100.0 * correct / total
 
 
-def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5, skip_vit=False):
+def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5, skip_vit=False, skip_hit=False):
     device = get_device()
     print(f"Device: {device}")
     print(f"Epochs: {num_epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"Attention probe every {attn_probe_interval} epochs")
     if skip_vit:
         print("Skipping ViT-Tiny (--skip_vit)")
+    if skip_hit:
+        print("Skipping HiT-Tiny (--skip_hit)")
     print()
 
     train_loader, val_loader = get_cifar10(batch_size)
@@ -277,6 +279,8 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, attn_probe_interval=5
     models_to_run = [("ViT-Tiny", ViTTiny), ("HiT-Tiny", HiTTiny)]
     if skip_vit:
         models_to_run = [("HiT-Tiny", HiTTiny)]
+    if skip_hit:
+        models_to_run = [("ViT-Tiny", ViTTiny)]
 
     for name, model_fn in models_to_run:
         print(f"{'='*60}")
@@ -442,6 +446,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--attn_probe_interval", type=int, default=5)
     parser.add_argument("--skip_vit", action="store_true", help="Skip ViT-Tiny, only run HiT-Tiny")
+    parser.add_argument("--skip_hit", action="store_true", help="Skip HiT-Tiny, only run ViT-Tiny")
     args = parser.parse_args()
     run_experiment(
         num_epochs=args.num_epochs,
@@ -449,4 +454,5 @@ if __name__ == "__main__":
         lr=args.lr,
         attn_probe_interval=args.attn_probe_interval,
         skip_vit=args.skip_vit,
+        skip_hit=args.skip_hit,
     )
