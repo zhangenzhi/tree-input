@@ -231,6 +231,7 @@ def analyze():
         logits_t, probs_t = extract_attention(hit_tiny, images)
     avg_logits_t = logits_t.mean(dim=(0, 1)).numpy()
     avg_probs_t = probs_t.mean(dim=(0, 1)).numpy()
+    max_probs_t = probs_t.max(dim=1).values.mean(dim=0).numpy()  # max over heads, mean over batch
     stats_t = compute_stats(avg_logits_t, avg_probs_t, LEVELS)
     print_stats("HiT-Tiny (embed_dim=192)", stats_t)
     all_stats["HiT-Tiny"] = stats_t
@@ -251,6 +252,7 @@ def analyze():
         logits_b, probs_b = extract_attention(hit_b, images)
     avg_logits_b = logits_b.mean(dim=(0, 1)).numpy()
     avg_probs_b = probs_b.mean(dim=(0, 1)).numpy()
+    max_probs_b = probs_b.max(dim=1).values.mean(dim=0).numpy()  # max over heads, mean over batch
     stats_b = compute_stats(avg_logits_b, avg_probs_b, LEVELS)
     print_stats("HiT-B (embed_dim=768)", stats_b)
     all_stats["HiT-B"] = stats_b
@@ -280,10 +282,48 @@ def analyze():
             ax.axvline(x=b - 0.5, color="red", linewidth=0.5, alpha=0.7)
         plt.colorbar(im, ax=ax)
 
-    plt.suptitle("Attention at Initialization: Tiny vs Base (CIFAR-10)", fontsize=14)
+    plt.suptitle("Attention at Initialization (mean): Tiny vs Base (CIFAR-10)", fontsize=14)
     plt.tight_layout()
     plt.savefig(os.path.join(fig_dir, "attention_heatmap_tiny_vs_base.png"), dpi=150)
     print(f"Saved: {fig_dir}/attention_heatmap_tiny_vs_base.png")
+
+    # 1b. Max-over-heads heatmaps (amplifies per-head structural patterns)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    for ax, max_probs, title in [
+        (axes[0], max_probs_t, f"HiT-Tiny (dim=192) max-over-heads"),
+        (axes[1], max_probs_b, f"HiT-B (dim=768) max-over-heads"),
+    ]:
+        im = ax.imshow(max_probs, cmap="hot", aspect="auto")
+        ax.set_title(title)
+        ax.set_xlabel("Key token")
+        ax.set_ylabel("Query token")
+        for b in boundaries:
+            ax.axhline(y=b - 0.5, color="cyan", linewidth=0.5, alpha=0.7)
+            ax.axvline(x=b - 0.5, color="cyan", linewidth=0.5, alpha=0.7)
+        plt.colorbar(im, ax=ax)
+
+    plt.suptitle("Attention at Initialization (max over heads): Tiny vs Base (CIFAR-10)", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "attention_heatmap_max_heads.png"), dpi=150)
+    print(f"Saved: {fig_dir}/attention_heatmap_max_heads.png")
+
+    # 1c. Per-head heatmaps for HiT-Tiny (show individual head patterns)
+    num_heads_t = probs_t.shape[1]
+    fig, axes = plt.subplots(1, num_heads_t, figsize=(4 * num_heads_t, 4))
+    per_head_t = probs_t.mean(dim=0).numpy()  # [heads, N, N]
+    for h in range(num_heads_t):
+        im = axes[h].imshow(per_head_t[h], cmap="hot", aspect="auto")
+        axes[h].set_title(f"Head {h}")
+        for b in boundaries:
+            axes[h].axhline(y=b - 0.5, color="cyan", linewidth=0.3, alpha=0.5)
+            axes[h].axvline(x=b - 0.5, color="cyan", linewidth=0.3, alpha=0.5)
+        axes[h].set_xticks([])
+        axes[h].set_yticks([])
+    plt.suptitle("HiT-Tiny: Per-Head Attention at Initialization", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(fig_dir, "attention_heatmap_per_head_tiny.png"), dpi=150)
+    print(f"Saved: {fig_dir}/attention_heatmap_per_head_tiny.png")
 
     # 2. Bar chart comparison
     fig, ax = plt.subplots(figsize=(10, 5))
