@@ -82,11 +82,28 @@ ViT-Tiny and HiT-Tiny (embed_dim=192, depth=6, heads=3) on CIFAR-10 (resized to 
 
 | Metric | ViT-Tiny | HiT-Tiny |
 |--------|----------|----------|
-| best val_acc | ~74.3% (ep50) | 79.1% (ep100) |
-| final train_acc | ~99%+ | 100% |
-| overfit gap | ~22% | ~21% |
+| best val_acc | 75.3% (ep90) | 79.1% (ep100) |
+| final train_acc | 100% | 100% |
+| final val_loss | 1.90 | 1.68 |
+| overfit gap (train-val acc) | 25% | 21% |
 
-**Finding**: HiT-Tiny maintains a ~5% advantage throughout training. Both models overfit severely without data augmentation, but HiT's val_acc ceiling is consistently higher. ViT val_acc plateaus around epoch 50 at ~74%, while HiT continues improving.
+#### ViT-Tiny 100 epoch details:
+
+| Epoch | train_loss | train_acc | val_loss | val_acc |
+|-------|-----------|-----------|---------|---------|
+| 1 | 1.878 | 29.3% | 1.697 | 36.5% |
+| 10 | 1.052 | 61.9% | 1.113 | 60.0% |
+| 20 | 0.636 | 77.3% | 0.873 | 69.8% |
+| 30 | 0.310 | 88.9% | 0.979 | 71.6% |
+| 50 | 0.080 | 97.2% | 1.420 | 71.0% |
+| 70 | 0.013 | 99.6% | 1.563 | 74.3% |
+| 90 | 0.000 | 100.0% | 1.899 | 75.3% |
+
+**Finding**:
+- HiT-Tiny maintains ~4% advantage at convergence (79.1% vs 75.3%).
+- Both models overfit severely, but HiT has a smaller train-val gap (21% vs 25%).
+- ViT val_loss diverges earlier (ep20: 0.87) and more severely (ep90: 1.90) than HiT (ep90: 1.68).
+- Despite val_loss increasing monotonically after epoch 20, ViT val_acc continues to slowly improve (69.8% → 75.3%), suggesting the model is still learning some generalizable features even while overfitting.
 
 **Conclusion**: **Hypothesis A is supported** — multi-scale input improves classification performance on CIFAR-10.
 
