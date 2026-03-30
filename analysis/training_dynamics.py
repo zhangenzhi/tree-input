@@ -369,6 +369,47 @@ def main():
 
     all_snapshots = []
     snapshot_epochs = []
+    level_names = [f"L{i}({n}x{n})" for i, n in enumerate(LEVELS)]
+    num_levels = len(LEVELS)
+
+    # Log file
+    log_path = os.path.join(fig_dir, "dynamics.log")
+    log_file = open(log_path, "w")
+
+    def log(msg):
+        print(msg)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    def log_snapshot(snap, epoch):
+        num_layers = len(snap["entropy_per_layer"])
+        log(f"\n{'='*80}")
+        log(f"SNAPSHOT: Epoch {epoch}")
+        log(f"{'='*80}")
+
+        log(f"\n  Entropy per layer:")
+        log(f"    " + "  ".join(f"L{l+1:2d}" for l in range(num_layers)))
+        log(f"    " + "  ".join(f"{v:5.2f}" for v in snap["entropy_per_layer"]))
+
+        log(f"\n  CLS attention to each level (per layer):")
+        log(f"    {'Layer':>5s}  " + "  ".join(f"{name:>10s}" for name in level_names))
+        for l in range(num_layers):
+            vals = "  ".join(f"{v:10.4f}" for v in snap["cls_level_attn"][l])
+            log(f"    {l+1:5d}  {vals}")
+
+        log(f"\n  Value norm per level (per layer):")
+        log(f"    {'Layer':>5s}  " + "  ".join(f"{name:>10s}" for name in level_names))
+        for l in range(num_layers):
+            vals = "  ".join(f"{v:10.4f}" for v in snap["value_norm_per_level"][l])
+            log(f"    {l+1:5d}  {vals}")
+
+        log(f"\n  Feature norm per level (per layer):")
+        log(f"    {'Layer':>5s}  " + "  ".join(f"{name:>10s}" for name in level_names))
+        for l in range(num_layers):
+            vals = "  ".join(f"{v:10.4f}" for v in snap["feature_norm_per_level"][l])
+            log(f"    {l+1:5d}  {vals}")
+
+    log(f"Log: {log_path}")
 
     # Snapshot at init
     model.eval()
@@ -378,7 +419,7 @@ def main():
     all_snapshots.append(snap)
     snapshot_epochs.append(0)
     plot_snapshot(snap, 0, LEVELS, fig_dir)
-    print(f"  [Snapshot epoch 0] entropy_L1={snap['entropy_per_layer'][0]:.3f}")
+    log_snapshot(snap, 0)
 
     for epoch in range(args.num_epochs):
         model.train()
@@ -407,18 +448,16 @@ def main():
             all_snapshots.append(snap)
             snapshot_epochs.append(epoch + 1)
             plot_snapshot(snap, epoch + 1, LEVELS, fig_dir)
-            print(f"  [Epoch {epoch+1:3d}] loss={train_loss:.4f} acc={train_acc:.1f}% | "
-                  f"entropy_L1={snap['entropy_per_layer'][0]:.3f} "
-                  f"cls_L0={snap['cls_level_attn'][0][0]:.4f}")
+            log(f"\n  [Epoch {epoch+1:3d}] loss={train_loss:.4f} acc={train_acc:.1f}%")
+            log_snapshot(snap, epoch + 1)
         elif (epoch + 1) % 10 == 0:
-            print(f"  [Epoch {epoch+1:3d}] loss={train_loss:.4f} acc={train_acc:.1f}%")
+            log(f"  [Epoch {epoch+1:3d}] loss={train_loss:.4f} acc={train_acc:.1f}%")
 
     # ---- Level Ablation Test ----
-    # After training, test val_acc with different level subsets removed
-    print()
-    print("=" * 60)
-    print("Level Ablation Test (trained model)")
-    print("=" * 60)
+    log("")
+    log("=" * 60)
+    log("Level Ablation Test (trained model)")
+    log("=" * 60)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     ablation_configs = [
@@ -474,12 +513,12 @@ def main():
         acc = 100.0 * correct / total_count
         n_tokens = x.shape[1] if keep_levels is not None else 1 + sum(n * n for n in LEVELS)
         ablation_results.append({"config": config_name, "val_acc": acc, "tokens": n_tokens})
-        print(f"  {config_name:25s} | tokens={n_tokens:4d} | val_acc={acc:.1f}%")
+        log(f"  {config_name:25s} | tokens={n_tokens:4d} | val_acc={acc:.1f}%")
 
     # Save ablation results
     with open(os.path.join(fig_dir, "ablation_results.json"), "w") as f:
         json.dump(ablation_results, f, indent=2)
-    print(f"\nSaved: {fig_dir}/ablation_results.json")
+    log(f"\nSaved: {fig_dir}/ablation_results.json")
 
     # Ablation bar chart
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -497,8 +536,8 @@ def main():
     ax.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
     plt.savefig(os.path.join(fig_dir, "level_ablation.png"), dpi=150)
-    print(f"Saved: {fig_dir}/level_ablation.png")
-    print()
+    log(f"Saved: {fig_dir}/level_ablation.png")
+    log("")
 
     # Save all snapshots
     serializable = []
@@ -507,12 +546,14 @@ def main():
         serializable.append(s)
     with open(os.path.join(fig_dir, "dynamics_history.json"), "w") as f:
         json.dump({"epochs": snapshot_epochs, "snapshots": serializable}, f, indent=2)
-    print(f"\nSaved: {fig_dir}/dynamics_history.json")
+    log(f"\nSaved: {fig_dir}/dynamics_history.json")
 
     # Evolution plot
     plot_evolution(all_snapshots, snapshot_epochs, LEVELS, fig_dir)
 
-    print("Done.")
+    log(f"\nLog saved to: {log_path}")
+    log("Done.")
+    log_file.close()
 
 
 if __name__ == "__main__":
