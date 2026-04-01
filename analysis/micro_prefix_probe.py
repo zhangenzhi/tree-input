@@ -285,6 +285,96 @@ class HiTTiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTRandomTiny(nn.Module):
+    """HiT with random-prefix: 85 duplicated random fine-level patches + 196 standard patches.
+    Same token count as HiT, but prefix carries redundant (not new) information.
+    """
+
+    def __init__(self, num_classes=10, num_random=85):
+        super().__init__()
+        self.num_random = num_random
+        self.patch_size = 16
+        self.levels = [14]
+        self.total_fine = 14 * 14
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def forward(self, images):
+        B = images.size(0)
+
+        # Extract standard fine patches
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)  # [B, 196, C*P*P]
+
+        # Randomly duplicate 85 patches from fine level
+        if self.training:
+            indices = torch.randint(0, 196, (self.num_random,))
+        else:
+            torch.manual_seed(0)
+            indices = torch.randint(0, 196, (self.num_random,))
+
+        random_patches = fine_patches[:, indices, :]  # [B, 85, C*P*P]
+        random_coords = self.fine_coords[indices]  # [85, 3]
+
+        # Concatenate: [random | fine]
+        all_patches = torch.cat([random_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([random_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
+def extract_layer_features_random(model, images):
+    """Extract per-layer features from HiT-Random."""
+    B = images.size(0)
+    fine_patches = extract_pyramid_patches(images, [14], model.patch_size)
+
+    torch.manual_seed(0)
+    indices = torch.randint(0, 196, (model.num_random,))
+    random_patches = fine_patches[:, indices, :]
+    random_coords = model.fine_coords[indices]
+
+    all_patches = torch.cat([random_patches, fine_patches], dim=1)
+    x = model.patch_proj(all_patches)
+
+    all_coords = torch.cat([random_coords, model.fine_coords], dim=0)
+    pe = model.pe(all_coords)
+    x = x + pe.unsqueeze(0)
+
+    cls_tokens = model.cls_token.expand(B, -1, -1) + model.cls_pos
+    x = torch.cat([cls_tokens, x], dim=1)
+    x = model.pos_drop(x)
+
+    layer_features = []
+    for block in model.blocks:
+        x = x + block.attn(block.norm1(x))
+        x = x + block.mlp(block.norm2(x))
+        layer_features.append(x.detach())
+    return layer_features
+
+
 def collect_features(model, loader, extract_fn, device):
     model.eval()
     all_features = None
@@ -400,6 +490,7 @@ def main():
         ("ViT-Tiny", ViTTiny, "vit_tiny_cifar10.pt", extract_layer_features_vit),
         ("HiT-Tiny (macro)", HiTTiny, "hit_tiny_cifar10.pt", extract_layer_features_hit),
         ("HiT-micro", HiTMicroTiny, "hit_micro_tiny_cifar10.pt", extract_layer_features_micro),
+        ("HiT-random", HiTRandomTiny, "hit_random_tiny_cifar10.pt", extract_layer_features_random),
     ]
 
     for name, model_cls, ckpt_name, extract_fn in models_config:
@@ -409,6 +500,8 @@ def main():
         torch.manual_seed(42)
         if name == "HiT-micro":
             model = model_cls(num_classes=10, num_micro=NUM_MICRO, crop_size=MICRO_CROP_SIZE).to(device)
+        elif name == "HiT-random":
+            model = model_cls(num_classes=10, num_random=NUM_MICRO).to(device)
         else:
             model = model_cls(num_classes=10).to(device)
 
@@ -442,11 +535,18 @@ def main():
                 ("L4 only", list(range(86, 282))),
                 ("L0-L3 only", list(range(1, 86))),
             ]
-        else:  # HiT-micro
+        elif name == "HiT-micro":
             probe_configs = [
                 ("CLS", [0]),
                 ("Fine only (L4)", list(range(86, 282))),
                 ("Micro only", list(range(1, 86))),
+                ("All tokens", list(range(1, 282))),
+            ]
+        else:  # HiT-random
+            probe_configs = [
+                ("CLS", [0]),
+                ("Fine only (L4)", list(range(86, 282))),
+                ("Random only", list(range(1, 86))),
                 ("All tokens", list(range(1, 282))),
             ]
 
@@ -480,17 +580,21 @@ def main():
     vit_l4 = results["ViT-Tiny"]["All patches"]
     hit_macro_l4 = results["HiT-Tiny (macro)"]["L4 only"]
     hit_micro_l4 = results["HiT-micro"]["Fine only (L4)"]
+    hit_random_l4 = results["HiT-random"]["Fine only (L4)"]
     num_layers = len(vit_l4)
 
     log(f"\n{'Model':>20s}  " + "  ".join(f"L{l+1:2d}" for l in range(num_layers)))
     log(f"{'ViT patches':>20s}  " + "  ".join(f"{a:5.1f}" for a in vit_l4))
     log(f"{'HiT-macro L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_macro_l4))
     log(f"{'HiT-micro L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_micro_l4))
+    log(f"{'HiT-random L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_random_l4))
 
     diff_macro = [m - v for m, v in zip(hit_macro_l4, vit_l4)]
     diff_micro = [m - v for m, v in zip(hit_micro_l4, vit_l4)]
+    diff_random = [m - v for m, v in zip(hit_random_l4, vit_l4)]
     log(f"{'Macro-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_macro))
     log(f"{'Micro-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_micro))
+    log(f"{'Random-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_random))
 
     # ---- Plot ----
     layers = list(range(1, num_layers + 1))
@@ -501,9 +605,10 @@ def main():
     axes[0].plot(layers, vit_l4, marker="o", label="ViT patches (196)", linewidth=2)
     axes[0].plot(layers, hit_macro_l4, marker="s", label="HiT-macro L4 (196)", linewidth=2)
     axes[0].plot(layers, hit_micro_l4, marker="^", label="HiT-micro L4 (196)", linewidth=2)
+    axes[0].plot(layers, hit_random_l4, marker="x", label="HiT-random L4 (196)", linewidth=2, linestyle=":")
     axes[0].set_xlabel("Layer")
     axes[0].set_ylabel("Probe Val Accuracy (%)")
-    axes[0].set_title("Fine-level (L4) Probe: Macro vs Micro Prefix")
+    axes[0].set_title("Fine-level (L4) Probe: Macro vs Micro vs Random Prefix")
     axes[0].set_xticks(layers)
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
@@ -511,10 +616,11 @@ def main():
     # Right: Diff vs ViT
     axes[1].plot(layers, diff_macro, marker="s", label="Macro prefix - ViT", linewidth=2, color="tab:orange")
     axes[1].plot(layers, diff_micro, marker="^", label="Micro prefix - ViT", linewidth=2, color="tab:green")
+    axes[1].plot(layers, diff_random, marker="x", label="Random prefix - ViT", linewidth=2, color="tab:gray", linestyle=":")
     axes[1].axhline(y=0, color="red", linestyle="--", alpha=0.5)
     axes[1].set_xlabel("Layer")
     axes[1].set_ylabel("Accuracy Difference vs ViT (%)")
-    axes[1].set_title("Internalization Gap: Macro vs Micro Prefix")
+    axes[1].set_title("Internalization Gap: Macro vs Micro vs Random Prefix")
     axes[1].set_xticks(layers)
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
