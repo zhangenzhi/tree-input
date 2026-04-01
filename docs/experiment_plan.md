@@ -170,9 +170,147 @@ For each transformer layer, compute the mean spatial distance (in original image
 
 This directly measures whether ViT self-discovers equivalent hierarchical representations, or whether HiT's explicit multi-scale input provides information that ViT cannot extract from single-scale patches alone.
 
+### 4.7 Level Ablation (trained HiT-Tiny, 100 epochs)
+
+| Config | Tokens | Val Acc | vs Full |
+|--------|--------|---------|---------|
+| Full (L0-L4) | 282 | 80.0% | — |
+| L4 only (fine) | 197 | 79.6% | -0.4% |
+| L0-L3 only (coarse) | 86 | 70.1% | -9.9% |
+| L3-L4 | 261 | 80.2% | +0.2% |
+| L0+L4 | 198 | 79.7% | -0.3% |
+
+**Findings:**
+- Removing L0-L3 only drops 0.4%. Hierarchical information has been largely internalized.
+- L0-L3 alone (70.1%) cannot classify well — their value is in training-time structural guidance, not direct classification features.
+- L3-L4 slightly outperforms Full (+0.2%), suggesting L0-L2 may be mild noise at inference.
+- **Practical implication**: Train with full pyramid (281 tokens), inference with L4 only (196 tokens). Same cost as ViT, but 79.6% vs 75.3% (+4.3%).
+
+### 4.8 Linear Probe Analysis
+
+*Status: done. Script: `analysis/linear_probe.py`*
+
+Train a linear classifier on frozen per-layer features, for each level separately.
+
+#### Results
+
+**ViT-Tiny probe accuracy per layer:**
+
+| Config | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
+|--------|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|------|------|
+| CLS | 34.5 | 45.2 | 52.2 | 56.9 | 60.0 | 63.2 | 64.3 | 67.0 | 69.0 | 71.3 | 72.8 | 75.2 |
+| All patches | 48.2 | 56.1 | 58.2 | 60.1 | 62.4 | 64.4 | 65.4 | 66.7 | 67.7 | 68.7 | 68.9 | 70.6 |
+
+**HiT-Tiny probe accuracy per layer:**
+
+| Config | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
+|--------|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|------|------|
+| CLS | 40.2 | 50.4 | 53.6 | 58.0 | 60.9 | 64.6 | 67.3 | 70.3 | 72.8 | 75.1 | 78.0 | 79.9 |
+| All tokens | 49.1 | 55.7 | 59.6 | 62.4 | 64.6 | 65.4 | 67.4 | 69.1 | 70.5 | 72.5 | 74.6 | 76.1 |
+| L4 only | 49.6 | 55.8 | 59.6 | 62.6 | 65.0 | 65.5 | 67.2 | 69.5 | 70.7 | 72.6 | 75.0 | 76.7 |
+| L0-L3 only | 46.5 | 53.7 | 57.7 | 60.7 | 62.8 | 64.7 | 65.7 | 68.1 | 69.5 | 71.2 | 73.6 | 74.7 |
+| L0(1x1) | 41.8 | 46.1 | 48.4 | 51.7 | 53.3 | 55.2 | 57.3 | 59.9 | 60.7 | 61.9 | 64.2 | 65.3 |
+| L1(2x2) | 41.2 | 48.2 | 50.9 | 53.9 | 56.1 | 58.5 | 60.2 | 62.5 | 64.5 | 65.5 | 68.0 | 69.0 |
+| L2(4x4) | 43.2 | 49.5 | 54.1 | 56.7 | 60.1 | 61.5 | 62.8 | 65.9 | 67.0 | 69.0 | 71.9 | 72.7 |
+| L3(8x8) | 46.4 | 53.4 | 57.5 | 61.0 | 63.7 | 64.9 | 66.0 | 68.4 | 69.6 | 71.5 | 74.0 | 74.9 |
+| L4(14x14) | 49.5 | 56.3 | 59.9 | 62.8 | 65.1 | 65.6 | 67.3 | 69.4 | 70.7 | 72.6 | 74.8 | 76.5 |
+
+**Key comparison — HiT L4 vs ViT patches (internalization gap):**
+
+| Layer | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
+|-------|------|------|------|------|------|------|------|------|------|-------|-------|-------|
+| Diff | +1.3 | -0.3 | +1.4 | +2.5 | +2.6 | +1.2 | +1.8 | +2.8 | +3.0 | +3.9 | +6.1 | +6.1 |
+
+#### Findings
+
+**F1: Internalized information accumulates across layers, concentrates in deep layers.**
+The HiT L4 vs ViT patches gap is small at shallow layers (+1.3 at L1) and grows to +6.1 at L11-L12. Each layer of cross-level interaction injects a small amount of structural information into L4. This is not a one-time injection but a gradual accumulation process.
+
+**F2: Information flow is bidirectional.**
+HiT L0-L3 only at L12 (74.7%) > ViT All patches at L12 (70.6%). The 85 coarse tokens outperform ViT's 196 fine tokens by 4.1%. This means fine-grained information flows into coarse tokens too — L0-L3 are not just static providers, they also absorb classification-relevant details from L4.
+
+**F3: In shallow layers, ViT's concentrated token count gives a slight edge.**
+At L2, ViT patches (56.1%) slightly outperform HiT L4 (55.8%). In the first 1-2 layers, ViT's 196 tokens are all fine-grained and directly task-relevant, while HiT's attention is partially "distracted" by learning cross-level relationships. This distraction disappears by L3 and reverses into a growing advantage.
+
+**F4: Per-level probe accuracy follows resolution order at final layer.**
+L0(65.3) < L1(69.0) < L2(72.7) < L3(74.9) < L4(76.5). Higher spatial resolution provides more discriminative spatial detail. But the gap between levels shrinks compared to what raw resolution would predict — L0 with 1 token achieving 65.3% is remarkable.
+
+**F5: CLS token in HiT builds classification readiness faster.**
+HiT CLS leads ViT CLS at every layer. The gap is +5.7 at L1, narrows to +1.4 at L6, then widens again to +4.7 at L12. The early advantage suggests HiT's CLS benefits from immediately accessible global tokens (L0-L1). The late widening suggests accumulated structural information provides better deep-layer features for classification.
+
+#### Interpretation
+
+The shallow-to-deep probe accuracy progression tells a coherent story:
+
+- **Shallow layers (L1-L3)**: Both models extract low-level features (edges, textures, colors). ViT's L4 tokens have a slight advantage because all 196 tokens carry task-relevant fine-grained features directly. HiT's L4 tokens are "distracted" — they spend attention budget learning cross-level relationships with L0-L3, which slightly reduces their per-layer feature quality in the first 2 layers.
+
+- **Middle layers (L4-L8)**: HiT L4 starts overtaking ViT patches. The cross-level interaction begins paying off — structural information from L0-L3 provides a regularizing global context. HiT's L4 tokens now carry both fine-grained local features AND injected hierarchical structure.
+
+- **Deep layers (L9-L12)**: The gap accelerates (+3.0 → +6.1). The accumulated structural information acts as a "macro-level regularizer" — HiT's L4 representations are better organized in feature space, leading to more linearly separable class boundaries. ViT's representations, without this structural scaffolding, plateau earlier.
+
+This supports the hypothesis that **hierarchical input provides a global structural prior that regularizes deep-layer representations**, rather than directly contributing classification features. The coarse tokens (L0-L3) are not information sources for classification — they are structural anchors that guide how L4's fine-grained features are organized.
+
+#### Open questions for next analysis (4.9)
+
+**Q1: Where in 192-d space is the +6.1% gap encoded?**
+SVD on HiT_L4 - ViT_patches residual at L12 to find the internalization subspace.
+
+**Q2: Is the internalized information low-rank or dispersed?**
+Singular value spectrum of the residual — determines whether structural knowledge is compact (extractable as a prior) or entangled with content.
+
+**Q3: Necessity verification.**
+Remove the internalization subspace from HiT L4 features → does acc drop to ViT level? Proves the identified subspace is necessary, not just correlated.
+
+### 4.9 Internalized Information Localization
+
+*Status: planned. Depends on linear probe results (4.8).*
+
+**Core question**: The level ablation (4.7) confirmed that hierarchical information has been internalized — removing L0-L3 at inference only drops 0.4%. But where in the 192-dimensional representation space is this information encoded?
+
+#### Method: Residual Subspace Analysis
+
+For the same set of images, extract HiT L4 and ViT patch representations at each layer. The difference between these two sets of representations encodes the internalized hierarchical information.
+
+**Step 1: Find the difference subspace.**
+- Compute residual matrix: R = HiT_L4_features - ViT_features (per sample, per token, matched by spatial position)
+- SVD on R: R = U @ S @ V^T
+- The top-k right singular vectors (columns of V) span the "internalization subspace"
+- Examine singular value spectrum: concentrated (low-rank) vs dispersed (high-rank)
+
+**Step 2: Probe inside and outside the subspace.**
+- Project HiT L4 features onto the internalization subspace → probe accuracy = contribution of internalized info
+- Project HiT L4 features onto the orthogonal complement → probe accuracy = contribution of shared (ViT-equivalent) info
+- If subspace probe ≈ HiT-ViT accuracy gap (~4%), the internalized information is precisely localized
+
+**Step 3: Necessity verification.**
+- Remove the subspace component from HiT L4 features (project onto orthogonal complement only)
+- Run classification: if acc drops to ViT level (~75%), confirms these dimensions are necessary for the hierarchical advantage
+- If acc doesn't drop, the internalized info is encoded differently (e.g., in covariance structure rather than mean direction)
+
+**Step 4: Track subspace evolution across layers.**
+- Compute the internalization subspace at each layer
+- Measure subspace alignment between adjacent layers (principal angle or subspace overlap)
+- If the subspace rotates across layers → information is being actively transformed
+- If the subspace is stable → information was injected once and preserved through residual connections
+
+**Expected outcomes:**
+- If internalized info is low-rank (top 5-10 singular vectors explain >80% variance): hierarchical knowledge is compact, potentially extractable as a learned "structural prior"
+- If high-rank: hierarchical info is deeply entangled with texture/content features, harder to isolate
+- Either result informs the "strong structure" direction — whether structural constraints can be cleanly separated from content, or whether they must be jointly learned
+
 ---
 
 ## 5. Analysis Scripts
+
+| Script | Purpose | Status |
+|--------|---------|--------|
+| `analysis/attention_init.py` | Attention bias at initialization (Tiny vs Base) | Done |
+| `analysis/attention_1epoch.py` | Fine-grained ratio tracking (every 50 steps, 100 epochs) | Done |
+| `analysis/convergence_test.py` | ViT vs HiT training curves (100 epochs) | Done |
+| `analysis/training_dynamics.py` | Per-layer heatmap/entropy/CLS-attn/norms + level ablation | Done |
+| `analysis/attention_distance.py` | Layer-wise attention distance + level attention distribution | Pending |
+| `analysis/linear_probe.py` | Per-layer per-level linear probe for ViT and HiT | Pending |
+| `analysis/internalization.py` | Residual subspace analysis: where is internalized info encoded | Planned |
 
 | Script | Purpose | Status |
 |--------|---------|--------|
