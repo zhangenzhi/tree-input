@@ -346,6 +346,87 @@ class HiTRandomTiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTFixedTiny(nn.Module):
+    """HiT with fixed-prefix: 85 fixed duplicated fine-level patches + 196 standard patches.
+    Same as HiT-random but selection is fixed (no randomness during training).
+    """
+
+    def __init__(self, num_classes=10, num_fixed=85):
+        super().__init__()
+        self.num_fixed = num_fixed
+        self.patch_size = 16
+        self.levels = [14]
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        # Fixed indices — same selection for every forward pass
+        torch.manual_seed(0)
+        fixed_indices = torch.randint(0, 196, (num_fixed,))
+        self.register_buffer("fixed_indices", fixed_indices)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def forward(self, images):
+        B = images.size(0)
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+
+        fixed_patches = fine_patches[:, self.fixed_indices, :]
+        fixed_coords = self.fine_coords[self.fixed_indices]
+
+        all_patches = torch.cat([fixed_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([fixed_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
+def extract_layer_features_fixed(model, images):
+    B = images.size(0)
+    fine_patches = extract_pyramid_patches(images, [14], model.patch_size)
+
+    fixed_patches = fine_patches[:, model.fixed_indices, :]
+    fixed_coords = model.fine_coords[model.fixed_indices]
+
+    all_patches = torch.cat([fixed_patches, fine_patches], dim=1)
+    x = model.patch_proj(all_patches)
+
+    all_coords = torch.cat([fixed_coords, model.fine_coords], dim=0)
+    pe = model.pe(all_coords)
+    x = x + pe.unsqueeze(0)
+
+    cls_tokens = model.cls_token.expand(B, -1, -1) + model.cls_pos
+    x = torch.cat([cls_tokens, x], dim=1)
+    x = model.pos_drop(x)
+
+    layer_features = []
+    for block in model.blocks:
+        x = x + block.attn(block.norm1(x))
+        x = x + block.mlp(block.norm2(x))
+        layer_features.append(x.detach())
+    return layer_features
+
+
 def extract_layer_features_random(model, images):
     """Extract per-layer features from HiT-Random."""
     B = images.size(0)
@@ -491,6 +572,7 @@ def main():
         ("HiT-Tiny (macro)", HiTTiny, "hit_tiny_cifar10.pt", extract_layer_features_hit),
         ("HiT-micro", HiTMicroTiny, "hit_micro_tiny_cifar10.pt", extract_layer_features_micro),
         ("HiT-random", HiTRandomTiny, "hit_random_tiny_cifar10.pt", extract_layer_features_random),
+        ("HiT-fixed", HiTFixedTiny, "hit_fixed_tiny_cifar10.pt", extract_layer_features_fixed),
     ]
 
     for name, model_cls, ckpt_name, extract_fn in models_config:
@@ -502,6 +584,8 @@ def main():
             model = model_cls(num_classes=10, num_micro=NUM_MICRO, crop_size=MICRO_CROP_SIZE).to(device)
         elif name == "HiT-random":
             model = model_cls(num_classes=10, num_random=NUM_MICRO).to(device)
+        elif name == "HiT-fixed":
+            model = model_cls(num_classes=10, num_fixed=NUM_MICRO).to(device)
         else:
             model = model_cls(num_classes=10).to(device)
 
@@ -542,11 +626,18 @@ def main():
                 ("Micro only", list(range(1, 86))),
                 ("All tokens", list(range(1, 282))),
             ]
-        else:  # HiT-random
+        elif name == "HiT-random":
             probe_configs = [
                 ("CLS", [0]),
                 ("Fine only (L4)", list(range(86, 282))),
                 ("Random only", list(range(1, 86))),
+                ("All tokens", list(range(1, 282))),
+            ]
+        else:  # HiT-fixed
+            probe_configs = [
+                ("CLS", [0]),
+                ("Fine only (L4)", list(range(86, 282))),
+                ("Fixed only", list(range(1, 86))),
                 ("All tokens", list(range(1, 282))),
             ]
 
@@ -581,6 +672,7 @@ def main():
     hit_macro_l4 = results["HiT-Tiny (macro)"]["L4 only"]
     hit_micro_l4 = results["HiT-micro"]["Fine only (L4)"]
     hit_random_l4 = results["HiT-random"]["Fine only (L4)"]
+    hit_fixed_l4 = results["HiT-fixed"]["Fine only (L4)"]
     num_layers = len(vit_l4)
 
     log(f"\n{'Model':>20s}  " + "  ".join(f"L{l+1:2d}" for l in range(num_layers)))
@@ -588,13 +680,16 @@ def main():
     log(f"{'HiT-macro L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_macro_l4))
     log(f"{'HiT-micro L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_micro_l4))
     log(f"{'HiT-random L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_random_l4))
+    log(f"{'HiT-fixed L4':>20s}  " + "  ".join(f"{a:5.1f}" for a in hit_fixed_l4))
 
     diff_macro = [m - v for m, v in zip(hit_macro_l4, vit_l4)]
     diff_micro = [m - v for m, v in zip(hit_micro_l4, vit_l4)]
     diff_random = [m - v for m, v in zip(hit_random_l4, vit_l4)]
+    diff_fixed = [m - v for m, v in zip(hit_fixed_l4, vit_l4)]
     log(f"{'Macro-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_macro))
     log(f"{'Micro-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_micro))
     log(f"{'Random-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_random))
+    log(f"{'Fixed-ViT diff':>20s}  " + "  ".join(f"{d:+5.1f}" for d in diff_fixed))
 
     # ---- Plot ----
     layers = list(range(1, num_layers + 1))
@@ -606,9 +701,10 @@ def main():
     axes[0].plot(layers, hit_macro_l4, marker="s", label="HiT-macro L4 (196)", linewidth=2)
     axes[0].plot(layers, hit_micro_l4, marker="^", label="HiT-micro L4 (196)", linewidth=2)
     axes[0].plot(layers, hit_random_l4, marker="x", label="HiT-random L4 (196)", linewidth=2, linestyle=":")
+    axes[0].plot(layers, hit_fixed_l4, marker="d", label="HiT-fixed L4 (196)", linewidth=2, linestyle=":")
     axes[0].set_xlabel("Layer")
     axes[0].set_ylabel("Probe Val Accuracy (%)")
-    axes[0].set_title("Fine-level (L4) Probe: Macro vs Micro vs Random Prefix")
+    axes[0].set_title("Fine-level (L4) Probe: Macro vs Micro vs Random vs Fixed")
     axes[0].set_xticks(layers)
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
@@ -617,10 +713,11 @@ def main():
     axes[1].plot(layers, diff_macro, marker="s", label="Macro prefix - ViT", linewidth=2, color="tab:orange")
     axes[1].plot(layers, diff_micro, marker="^", label="Micro prefix - ViT", linewidth=2, color="tab:green")
     axes[1].plot(layers, diff_random, marker="x", label="Random prefix - ViT", linewidth=2, color="tab:gray", linestyle=":")
+    axes[1].plot(layers, diff_fixed, marker="d", label="Fixed prefix - ViT", linewidth=2, color="tab:purple", linestyle=":")
     axes[1].axhline(y=0, color="red", linestyle="--", alpha=0.5)
     axes[1].set_xlabel("Layer")
     axes[1].set_ylabel("Accuracy Difference vs ViT (%)")
-    axes[1].set_title("Internalization Gap: Macro vs Micro vs Random Prefix")
+    axes[1].set_title("Internalization Gap: Macro vs Micro vs Random vs Fixed")
     axes[1].set_xticks(layers)
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
