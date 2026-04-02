@@ -250,9 +250,58 @@ The shallow-to-deep probe accuracy progression tells a coherent story:
 
 This supports the hypothesis that **hierarchical input provides a global structural prior that regularizes deep-layer representations**, rather than directly contributing classification features. The coarse tokens (L0-L3) are not information sources for classification — they are structural anchors that guide how L4's fine-grained features are organized.
 
+### 4.8b Micro-Prefix and Random-Prefix Control Experiments
+
+*Status: done. Script: `analysis/micro_prefix_probe.py`*
+
+Four-way comparison to isolate the source of macro-prefix's advantage.
+
+| Model | Prefix content | Tokens | New info vs L4? |
+|-------|---------------|--------|-----------------|
+| ViT-Tiny | none | 196 | — |
+| HiT-macro | L0-L3 coarse pyramid | 281 | Yes (global structure) |
+| HiT-micro | 85 random 8x8 crops | 281 | Partial (finer grain, overlaps with L4) |
+| HiT-random | 85 duplicated L4 patches | 281 | No (redundant) |
+
+#### Results
+
+**CLS probe at L12 (final classification ability):**
+
+| Model | CLS L12 |
+|-------|---------|
+| HiT-macro | **79.9%** |
+| HiT-random | 77.9% |
+| HiT-micro | 77.5% |
+| ViT | 75.2% |
+
+**L4 probe diff vs ViT (internalization into fine-level tokens):**
+
+| Model | L1 | L2 | L6 | L9 | L12 | Pattern |
+|-------|------|------|------|------|-------|---------|
+| Macro | +1.6 | -0.5 | +1.3 | +2.8 | **+5.7** | Deep-layer accumulation |
+| Micro | +0.2 | -1.8 | -0.9 | -0.4 | **+1.2** | Shallow harm, weak deep gain |
+| Random | -1.0 | -2.8 | -0.6 | -0.5 | **-1.1** | Harm throughout |
+
+#### Findings
+
+**F1: Macro prefix is uniquely effective — not replaceable by more tokens or finer granularity.**
+Only macro achieves significant L4 internalization (+5.7 at L12). The advantage comes specifically from global structural information that L4 tokens cannot obtain from their 16x16 local patches.
+
+**F2: Random prefix harms L4 but still helps CLS (+2.7% over ViT).**
+Redundant tokens degrade L4 quality (attention dilution) but CLS can still extract useful signal from the duplicated patches. This CLS gain may come from: (a) redundant views providing ensemble-like effect, (b) random selection during training acting as regularization noise. Both hypotheses need further verification.
+
+**F3: Micro ≈ Random at CLS level, but different internalization pattern.**
+Micro CLS (77.5%) ≈ Random CLS (77.9%), but micro shows weak L4 internalization at deep layers (+1.2) while random does not (-1.1). 8x8 crops provide marginally new information (sub-patch details), but the overlap with L4 is too large for significant internalization.
+
+**F4: Bidirectional internalization observed — macro (global→L4) and micro (detail→L4).**
+Both macro and micro show L4 probe gains at L12 (though vastly different magnitudes), suggesting L4 can absorb information from both coarser and finer scales. The macro direction is far more effective because it provides genuinely inaccessible information.
+
+**F5: Ranking — macro >> random ≈ micro > ViT (CLS); macro >> micro > ViT > random (L4 internalization).**
+For classification, any extra tokens help somewhat. For representation quality (internalization), only genuinely new cross-scale information matters.
+
 #### Open questions for next analysis (4.9)
 
-**Q1: Where in 192-d space is the +6.1% gap encoded?**
+**Q1: Where in 192-d space is the +5.7% gap encoded?**
 SVD on HiT_L4 - ViT_patches residual at L12 to find the internalization subspace.
 
 **Q2: Is the internalized information low-rank or dispersed?**
