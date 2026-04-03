@@ -198,17 +198,17 @@ Train a linear classifier on frozen per-layer features, for each level separatel
 
 | Config | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
 |--------|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|------|------|
-| CLS | 34.5 | 45.2 | 52.2 | 56.9 | 60.0 | 63.2 | 64.3 | 67.0 | 69.0 | 71.3 | 72.8 | 75.2 |
-| All patches | 48.2 | 56.1 | 58.2 | 60.1 | 62.4 | 64.4 | 65.4 | 66.7 | 67.7 | 68.7 | 68.9 | 70.6 |
+| CLS | 34.7 | 45.4 | 52.3 | 57.0 | 59.6 | 63.0 | 64.6 | 67.0 | 69.1 | 71.3 | 72.9 | 75.2 |
+| All patches | 48.1 | 56.1 | 58.1 | 60.1 | 62.1 | 64.2 | 65.5 | 66.7 | 67.9 | 68.7 | 69.1 | 70.8 |
 
 **HiT-Tiny probe accuracy per layer:**
 
 | Config | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
 |--------|-----|-----|-----|-----|-----|-----|-----|-----|-----|------|------|------|
-| CLS | 40.2 | 50.4 | 53.6 | 58.0 | 60.9 | 64.6 | 67.3 | 70.3 | 72.8 | 75.1 | 78.0 | 79.9 |
+| CLS | 40.0 | 50.4 | 53.7 | 58.0 | 61.0 | 64.4 | 67.2 | 70.4 | 72.7 | 75.1 | 78.2 | 79.9 |
 | All tokens | 49.1 | 55.7 | 59.6 | 62.4 | 64.6 | 65.4 | 67.4 | 69.1 | 70.5 | 72.5 | 74.6 | 76.1 |
-| L4 only | 49.6 | 55.8 | 59.6 | 62.6 | 65.0 | 65.5 | 67.2 | 69.5 | 70.7 | 72.6 | 75.0 | 76.7 |
-| L0-L3 only | 46.5 | 53.7 | 57.7 | 60.7 | 62.8 | 64.7 | 65.7 | 68.1 | 69.5 | 71.2 | 73.6 | 74.7 |
+| L4 only | 49.7 | 55.6 | 59.5 | 62.5 | 64.7 | 65.5 | 67.5 | 69.5 | 70.6 | 72.8 | 74.9 | 76.5 |
+| L0-L3 only | 46.1 | 53.4 | 57.6 | 60.8 | 63.0 | 64.6 | 65.8 | 68.5 | 69.2 | 71.5 | 73.6 | 74.8 |
 | L0(1x1) | 41.8 | 46.1 | 48.4 | 51.7 | 53.3 | 55.2 | 57.3 | 59.9 | 60.7 | 61.9 | 64.2 | 65.3 |
 | L1(2x2) | 41.2 | 48.2 | 50.9 | 53.9 | 56.1 | 58.5 | 60.2 | 62.5 | 64.5 | 65.5 | 68.0 | 69.0 |
 | L2(4x4) | 43.2 | 49.5 | 54.1 | 56.7 | 60.1 | 61.5 | 62.8 | 65.9 | 67.0 | 69.0 | 71.9 | 72.7 |
@@ -219,18 +219,18 @@ Train a linear classifier on frozen per-layer features, for each level separatel
 
 | Layer | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | L12 |
 |-------|------|------|------|------|------|------|------|------|------|-------|-------|-------|
-| Diff | +1.3 | -0.3 | +1.4 | +2.5 | +2.6 | +1.2 | +1.8 | +2.8 | +3.0 | +3.9 | +6.1 | +6.1 |
+| Diff | +1.6 | -0.5 | +1.4 | +2.4 | +2.6 | +1.3 | +2.0 | +2.8 | +2.8 | +4.2 | +5.8 | +5.7 |
 
 #### Findings
 
 **F1: Internalized information accumulates across layers, concentrates in deep layers.**
-The HiT L4 vs ViT patches gap is small at shallow layers (+1.3 at L1) and grows to +6.1 at L11-L12. Each layer of cross-level interaction injects a small amount of structural information into L4. This is not a one-time injection but a gradual accumulation process.
+The HiT L4 vs ViT patches gap is small at shallow layers (+1.6 at L1) and grows to +5.7 at L12. Each layer of cross-level interaction injects a small amount of structural information into L4. This is not a one-time injection but a gradual accumulation process.
 
 **F2: Information flow is bidirectional.**
 HiT L0-L3 only at L12 (74.7%) > ViT All patches at L12 (70.6%). The 85 coarse tokens outperform ViT's 196 fine tokens by 4.1%. This means fine-grained information flows into coarse tokens too — L0-L3 are not just static providers, they also absorb classification-relevant details from L4.
 
 **F3: In shallow layers, ViT's concentrated token count gives a slight edge.**
-At L2, ViT patches (56.1%) slightly outperform HiT L4 (55.8%). In the first 1-2 layers, ViT's 196 tokens are all fine-grained and directly task-relevant, while HiT's attention is partially "distracted" by learning cross-level relationships. This distraction disappears by L3 and reverses into a growing advantage.
+At L2, ViT patches (56.1%) slightly outperform HiT L4 (55.6%). In the first 1-2 layers, ViT's 196 tokens are all fine-grained and directly task-relevant, while HiT's attention is partially "distracted" by learning cross-level relationships. This distraction disappears by L3 and reverses into a growing advantage.
 
 **F4: Per-level probe accuracy follows resolution order at final layer.**
 L0(65.3) < L1(69.0) < L2(72.7) < L3(74.9) < L4(76.5). Higher spatial resolution provides more discriminative spatial detail. But the gap between levels shrinks compared to what raw resolution would predict — L0 with 1 token achieving 65.3% is remarkable.
@@ -250,18 +250,19 @@ The shallow-to-deep probe accuracy progression tells a coherent story:
 
 This supports the hypothesis that **hierarchical input provides a global structural prior that regularizes deep-layer representations**, rather than directly contributing classification features. The coarse tokens (L0-L3) are not information sources for classification — they are structural anchors that guide how L4's fine-grained features are organized.
 
-### 4.8b Micro-Prefix and Random-Prefix Control Experiments
+### 4.8b Control Experiments: Micro, Random, and Fixed Prefix
 
 *Status: done. Script: `analysis/micro_prefix_probe.py`*
 
-Four-way comparison to isolate the source of macro-prefix's advantage.
+Five-way comparison to isolate the source of macro-prefix's advantage.
 
 | Model | Prefix content | Tokens | New info vs L4? |
 |-------|---------------|--------|-----------------|
 | ViT-Tiny | none | 196 | — |
 | HiT-macro | L0-L3 coarse pyramid | 281 | Yes (global structure) |
 | HiT-micro | 85 random 8x8 crops | 281 | Partial (finer grain, overlaps with L4) |
-| HiT-random | 85 duplicated L4 patches | 281 | No (redundant) |
+| HiT-random | 85 randomly selected L4 patch duplicates (different each forward pass) | 281 | No (redundant) |
+| HiT-fixed | 85 fixed L4 patch duplicates (same patches every forward pass) | 281 | No (redundant) |
 
 #### Results
 
@@ -270,8 +271,9 @@ Four-way comparison to isolate the source of macro-prefix's advantage.
 | Model | CLS L12 |
 |-------|---------|
 | HiT-macro | **79.9%** |
-| HiT-random | 77.9% |
+| HiT-random | 78.0% |
 | HiT-micro | 77.5% |
+| HiT-fixed | 77.3% |
 | ViT | 75.2% |
 
 **L4 probe diff vs ViT (internalization into fine-level tokens):**
@@ -280,24 +282,28 @@ Four-way comparison to isolate the source of macro-prefix's advantage.
 |-------|------|------|------|------|-------|---------|
 | Macro | +1.6 | -0.5 | +1.3 | +2.8 | **+5.7** | Deep-layer accumulation |
 | Micro | +0.2 | -1.8 | -0.9 | -0.4 | **+1.2** | Shallow harm, weak deep gain |
-| Random | -1.0 | -2.8 | -0.6 | -0.5 | **-1.1** | Harm throughout |
+| Fixed | +0.7 | -2.0 | -1.4 | -0.1 | **+0.5** | Shallow harm, marginal deep gain |
+| Random | -1.4 | -3.0 | -0.3 | -0.5 | **-1.2** | Harm throughout |
 
 #### Findings
 
 **F1: Macro prefix is uniquely effective — not replaceable by more tokens or finer granularity.**
 Only macro achieves significant L4 internalization (+5.7 at L12). The advantage comes specifically from global structural information that L4 tokens cannot obtain from their 16x16 local patches.
 
-**F2: Random prefix harms L4 but still helps CLS (+2.7% over ViT).**
-Redundant tokens degrade L4 quality (attention dilution) but CLS can still extract useful signal from the duplicated patches. This CLS gain may come from: (a) redundant views providing ensemble-like effect, (b) random selection during training acting as regularization noise. Both hypotheses need further verification.
+**F2: Fixed vs Random disentangles redundancy from stochasticity.**
+Both use identical content (duplicated L4 patches), but fixed uses the same 85 patches every forward pass while random resamples each time. Fixed shows marginal positive L4 internalization (+0.5) while random harms L4 throughout (-1.2). This indicates that random prefix selection prevents stable cross-attention patterns from forming, actively degrading L4 representation quality. The stochasticity, not just the redundancy, is what harms L4.
 
-**F3: Micro ≈ Random at CLS level, but different internalization pattern.**
-Micro CLS (77.5%) ≈ Random CLS (77.9%), but micro shows weak L4 internalization at deep layers (+1.2) while random does not (-1.1). 8x8 crops provide marginally new information (sub-patch details), but the overlap with L4 is too large for significant internalization.
+**F3: Random prefix harms L4 but best helps CLS among non-macro controls.**
+Random CLS (78.0%) > Fixed CLS (77.3%) ≈ Micro CLS (77.5%), despite random having the worst L4 internalization. The random selection acts as training-time regularization noise (similar to dropout), benefiting the CLS token's robustness while degrading fine-level representations.
 
-**F4: Bidirectional internalization observed — macro (global→L4) and micro (detail→L4).**
+**F4: Micro and Fixed show weak but positive L4 internalization at deep layers.**
+Both micro (+1.2) and fixed (+0.5) achieve small positive internalization at L12, while random (-1.2) does not. Micro provides marginally new sub-patch information; fixed provides stable (though redundant) cross-attention targets. Both allow some degree of representation enrichment, but far less than macro's genuinely new global structure.
+
+**F5: Bidirectional internalization observed — macro (global→L4) and micro (detail→L4).**
 Both macro and micro show L4 probe gains at L12 (though vastly different magnitudes), suggesting L4 can absorb information from both coarser and finer scales. The macro direction is far more effective because it provides genuinely inaccessible information.
 
-**F5: Ranking — macro >> random ≈ micro > ViT (CLS); macro >> micro > ViT > random (L4 internalization).**
-For classification, any extra tokens help somewhat. For representation quality (internalization), only genuinely new cross-scale information matters.
+**F6: Final ranking — macro >> random ≈ micro ≈ fixed > ViT (CLS); macro >> micro > fixed > ViT > random (L4 internalization).**
+For classification, any extra tokens help somewhat (+2-3% CLS). For representation quality (internalization), only genuinely new cross-scale information matters, and prefix stability is a prerequisite for any positive internalization.
 
 #### Open questions for next analysis (4.9)
 
@@ -357,13 +363,7 @@ For the same set of images, extract HiT L4 and ViT patch representations at each
 | `analysis/attention_1epoch.py` | Fine-grained ratio tracking (every 50 steps, 100 epochs) | Done |
 | `analysis/convergence_test.py` | ViT vs HiT training curves (100 epochs) | Done |
 | `analysis/training_dynamics.py` | Per-layer heatmap/entropy/CLS-attn/norms + level ablation | Done |
+| `analysis/linear_probe.py` | Per-layer per-level linear probe for ViT and HiT | Done |
+| `analysis/micro_prefix_probe.py` | Micro/random/fixed prefix control + comparative probe | Done |
 | `analysis/attention_distance.py` | Layer-wise attention distance + level attention distribution | Pending |
-| `analysis/linear_probe.py` | Per-layer per-level linear probe for ViT and HiT | Pending |
 | `analysis/internalization.py` | Residual subspace analysis: where is internalized info encoded | Planned |
-
-| Script | Purpose | Status |
-|--------|---------|--------|
-| `analysis/attention_init.py` | Attention bias at initialization (Tiny vs Base) | Done |
-| `analysis/attention_1epoch.py` | Fine-grained ratio tracking (every 50 steps, 100 epochs) | Done |
-| `analysis/convergence_test.py` | ViT vs HiT training curves (100 epochs) | Done |
-| `analysis/attention_distance.py` | Layer-wise attention distance + level attention distribution | Pending |
