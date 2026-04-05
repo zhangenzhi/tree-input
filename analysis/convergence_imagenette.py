@@ -1,13 +1,12 @@
 """
-Convergence comparison: HiT vs ViT on Imagenette (10 classes, native high-res).
+Convergence comparison on Imagenette (10 classes, native high-res).
 
-Uses ViT-Tiny scale (embed_dim=192, depth=12, heads=3) for speed.
-Imagenette images are natively high-resolution, so sub-patch detail is real.
+Models: ViT-Tiny, HiT-Tiny (macro), HiT-micro, HiT-random.
 
 Usage:
     python analysis/convergence_imagenette.py --num_epochs 100
-    python analysis/convergence_imagenette.py --num_epochs 100 --skip_vit
-    python analysis/convergence_imagenette.py --num_epochs 100 --skip_hit
+    python analysis/convergence_imagenette.py --num_epochs 100 --models hit_micro,hit_random
+    python analysis/convergence_imagenette.py --num_epochs 100 --models all
 """
 
 import sys
@@ -27,6 +26,8 @@ from dataset.imagenette import get_imagenette
 
 LEVELS = [1, 2, 4, 8, 14]
 NUM_CLASSES = 10
+NUM_MICRO = 85
+MICRO_CROP_SIZE = 8
 
 
 def get_device():
@@ -89,6 +90,124 @@ class HiTTiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTMicroTiny(nn.Module):
+    """HiT with micro-prefix: 85 random 8x8 crops + 196 standard patches."""
+
+    def __init__(self, num_classes=NUM_CLASSES, num_micro=NUM_MICRO, crop_size=MICRO_CROP_SIZE):
+        super().__init__()
+        self.num_micro = num_micro
+        self.crop_size = crop_size
+        self.patch_size = 16
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def _extract_micro(self, images):
+        import torch.nn.functional as F
+        B, C, H, W = images.shape
+        if self.training:
+            top = torch.randint(0, H - self.crop_size + 1, (self.num_micro,))
+            left = torch.randint(0, W - self.crop_size + 1, (self.num_micro,))
+        else:
+            torch.manual_seed(0)
+            top = torch.randint(0, H - self.crop_size + 1, (self.num_micro,))
+            left = torch.randint(0, W - self.crop_size + 1, (self.num_micro,))
+        crops, coords = [], []
+        for i in range(self.num_micro):
+            t, l = top[i].item(), left[i].item()
+            crop = images[:, :, t:t+self.crop_size, l:l+self.crop_size]
+            resized = F.interpolate(crop, size=(self.patch_size, self.patch_size),
+                                    mode='bilinear', align_corners=False)
+            crops.append(resized.reshape(B, -1))
+            coords.append([(l + self.crop_size/2)/W, (t + self.crop_size/2)/H, self.crop_size/H])
+        return torch.stack(crops, dim=1), torch.tensor(coords, dtype=torch.float32)
+
+    def forward(self, images):
+        B = images.size(0)
+        micro_patches, micro_coords = self._extract_micro(images)
+        micro_coords = micro_coords.to(images.device)
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+
+        all_patches = torch.cat([micro_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([micro_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
+class HiTRandomTiny(nn.Module):
+    """HiT with random-prefix: 85 randomly duplicated L4 patches + 196 standard patches."""
+
+    def __init__(self, num_classes=NUM_CLASSES, num_random=NUM_MICRO):
+        super().__init__()
+        self.num_random = num_random
+        self.patch_size = 16
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def forward(self, images):
+        B = images.size(0)
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+
+        if self.training:
+            indices = torch.randint(0, 196, (self.num_random,))
+        else:
+            torch.manual_seed(0)
+            indices = torch.randint(0, 196, (self.num_random,))
+
+        random_patches = fine_patches[:, indices, :]
+        random_coords = self.fine_coords[indices]
+
+        all_patches = torch.cat([random_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([random_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
 # ---- Training ----
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -128,15 +247,12 @@ def validate(model, loader, criterion, device):
 
 
 def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
-                   num_workers=4, skip_vit=False, skip_hit=False):
+                   num_workers=4, models="vit,hit"):
     device = get_device()
     print(f"Device: {device}")
     print(f"Dataset: Imagenette (10 classes, native high-res)")
     print(f"Epochs: {num_epochs}, Batch size: {batch_size}, LR: {lr}")
-    if skip_vit:
-        print("Skipping ViT-Tiny (--skip_vit)")
-    if skip_hit:
-        print("Skipping HiT-Tiny (--skip_hit)")
+    print(f"Models: {models}")
     print()
 
     train_loader, val_loader, _ = get_imagenette(
@@ -148,23 +264,48 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
     criterion = nn.CrossEntropyLoss()
     results = {}
 
+    all_models = {
+        "vit": ("ViT-Tiny", ViTTiny, "vit_tiny_imagenette.pt"),
+        "hit": ("HiT-Tiny", HiTTiny, "hit_tiny_imagenette.pt"),
+        "hit_micro": ("HiT-micro", HiTMicroTiny, "hit_micro_tiny_imagenette.pt"),
+        "hit_random": ("HiT-random", HiTRandomTiny, "hit_random_tiny_imagenette.pt"),
+    }
+
+    if models == "all":
+        model_keys = list(all_models.keys())
+    else:
+        model_keys = [m.strip() for m in models.split(",")]
+
     models_to_run = []
-    if not skip_vit:
-        models_to_run.append(("ViT-Tiny", ViTTiny))
-    if not skip_hit:
-        models_to_run.append(("HiT-Tiny", HiTTiny))
+    for key in model_keys:
+        if key in all_models:
+            models_to_run.append(all_models[key])
 
     ckpt_dir = os.path.join("output", "imagenette_ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    for name, model_fn in models_to_run:
-        print(f"{'='*60}")
-        print(f"Training {name}...")
+    for name, model_cls, ckpt_name in models_to_run:
+        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+
         print(f"{'='*60}")
 
         torch.manual_seed(42)
-        model = model_fn(num_classes=NUM_CLASSES).to(device)
+        model = model_cls(num_classes=NUM_CLASSES).to(device)
         param_count = sum(p.numel() for p in model.parameters())
+
+        # Load checkpoint if exists
+        if os.path.exists(ckpt_path):
+            print(f"Loading {name} from {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+            model.load_state_dict(ckpt["model"])
+            print(f"  Loaded (epoch={ckpt['epoch']}, val_acc={ckpt.get('best_val_acc', ckpt.get('val_acc', '?'))}%)")
+            print(f"  Skipping training, using cached results.")
+            results[name] = None  # no history, just checkpoint
+            print()
+            continue
+
+        print(f"Training {name}...")
+        print(f"{'='*60}")
         print(f"Parameters: {param_count:,}")
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
@@ -206,9 +347,6 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
 
         results[name] = history
 
-        # Save checkpoint
-        tag = "vit" if "ViT" in name else "hit"
-        ckpt_path = os.path.join(ckpt_dir, f"{tag}_tiny_imagenette.pt")
         torch.save({
             "epoch": num_epochs,
             "model": model.state_dict(),
@@ -231,10 +369,9 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     epochs = range(1, num_epochs + 1)
 
-    for name in ["ViT-Tiny", "HiT-Tiny"]:
-        if name not in results:
+    for name, hist in results.items():
+        if hist is None:
             continue
-        hist = results[name]
         axes[0, 0].plot(epochs, hist["train_loss"], label=name, linewidth=1.5)
         axes[0, 1].plot(epochs, hist["val_loss"], label=name, linewidth=1.5)
         axes[1, 0].plot(epochs, hist["train_acc"], label=name, linewidth=1.5)
@@ -250,7 +387,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle(f"ViT-Tiny vs HiT-Tiny on Imagenette ({num_epochs} epochs)", fontsize=14)
+    plt.suptitle(f"Imagenette Convergence ({num_epochs} epochs)", fontsize=14)
     plt.tight_layout()
     plt.savefig(os.path.join(fig_dir, "imagenette_convergence.png"), dpi=150)
     print(f"Saved: {fig_dir}/imagenette_convergence.png")
@@ -260,10 +397,9 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    for name in ["ViT-Tiny", "HiT-Tiny"]:
-        if name not in results:
+    for name, hist in results.items():
+        if hist is None:
             continue
-        hist = results[name]
         best_val = max(hist["val_acc"])
         best_epoch = hist["val_acc"].index(best_val) + 1
         avg_time = np.mean(hist["epoch_time"])
@@ -283,8 +419,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--skip_vit", action="store_true")
-    parser.add_argument("--skip_hit", action="store_true")
+    parser.add_argument("--models", type=str, default="vit,hit",
+                        help="Comma-separated: vit,hit,hit_micro,hit_random or 'all'")
     args = parser.parse_args()
     run_experiment(
         num_epochs=args.num_epochs,
@@ -292,6 +428,5 @@ if __name__ == "__main__":
         lr=args.lr,
         data_dir=args.data_dir,
         num_workers=args.num_workers,
-        skip_vit=args.skip_vit,
-        skip_hit=args.skip_hit,
+        models=args.models,
     )
