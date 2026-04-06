@@ -411,6 +411,90 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
               f"avg_time={avg_time:.1f}s/ep")
 
 
+def run_ablation(batch_size=64, data_dir="./data", num_workers=4):
+    """Level ablation test on trained HiT-macro checkpoint."""
+    device = get_device()
+    print(f"Device: {device}")
+    print()
+
+    _, val_loader, _ = get_imagenette(
+        batch_size=batch_size, data_dir=data_dir, num_workers=num_workers,
+    )
+    print(f"Val: {len(val_loader.dataset)} images")
+    print()
+
+    # Load HiT-macro checkpoint
+    ckpt_dir = os.path.join("output", "imagenette_ckpt")
+    ckpt_path = os.path.join(ckpt_dir, "hit_tiny_imagenette.pt")
+
+    torch.manual_seed(42)
+    model = HiTTiny(num_classes=NUM_CLASSES).to(device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model.load_state_dict(ckpt["model"])
+    print(f"Loaded HiT-macro from {ckpt_path}")
+    print(f"  epoch={ckpt['epoch']}, best_val_acc={ckpt.get('best_val_acc', '?')}%")
+    print()
+
+    # Level offsets
+    level_offsets = {}
+    offset = 1
+    for lvl_idx, n in enumerate(LEVELS):
+        level_offsets[lvl_idx] = (offset, offset + n * n)
+        offset += n * n
+
+    ablation_configs = [
+        ("Full (L0-L4)", None),
+        ("L4 only (fine)", [4]),
+        ("L0-L3 only (coarse)", [0, 1, 2, 3]),
+        ("L3-L4", [3, 4]),
+        ("L0+L4", [0, 4]),
+        ("L2-L4", [2, 3, 4]),
+        ("L1-L4", [1, 2, 3, 4]),
+    ]
+
+    print("=" * 60)
+    print("Level Ablation Test (Imagenette)")
+    print("=" * 60)
+
+    model.eval()
+    for config_name, keep_levels in ablation_configs:
+        correct, total_count = 0, 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                B = images.size(0)
+
+                patches = extract_pyramid_patches(images, model.levels, model.patch_size)
+                x = model.patch_proj(patches)
+                pe = model.pe(model.pyramid_coords)
+                x = x + pe.unsqueeze(0)
+                cls_tokens = model.cls_token.expand(B, -1, -1) + model.cls_pos
+                x = torch.cat([cls_tokens, x], dim=1)
+
+                if keep_levels is not None:
+                    keep_indices = [0]  # CLS
+                    for lvl_idx in keep_levels:
+                        s, e = level_offsets[lvl_idx]
+                        keep_indices.extend(range(s, e))
+                    x = x[:, keep_indices, :]
+
+                x = model.pos_drop(x)
+                x = model.blocks(x)
+                x = model.norm(x)
+                logits = model.head(x[:, 0])
+
+                _, predicted = logits.max(1)
+                correct += predicted.eq(labels).sum().item()
+                total_count += labels.size(0)
+
+        acc = 100.0 * correct / total_count
+        n_tokens = len(keep_indices) if keep_levels is not None else 1 + sum(n * n for n in LEVELS)
+        print(f"  {config_name:25s} | tokens={n_tokens:4d} | val_acc={acc:.1f}%")
+
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -421,12 +505,22 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--models", type=str, default="vit,hit",
                         help="Comma-separated: vit,hit,hit_micro,hit_random or 'all'")
+    parser.add_argument("--ablation", action="store_true",
+                        help="Run level ablation on trained HiT-macro checkpoint")
     args = parser.parse_args()
-    run_experiment(
-        num_epochs=args.num_epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        data_dir=args.data_dir,
-        num_workers=args.num_workers,
-        models=args.models,
-    )
+
+    if args.ablation:
+        run_ablation(
+            batch_size=args.batch_size,
+            data_dir=args.data_dir,
+            num_workers=args.num_workers,
+        )
+    else:
+        run_experiment(
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            data_dir=args.data_dir,
+            num_workers=args.num_workers,
+            models=args.models,
+        )
