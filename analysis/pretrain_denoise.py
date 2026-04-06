@@ -32,6 +32,7 @@ import timm
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from model.hit import extract_pyramid_patches, build_pyramid_coords, ContinuousPE3D
+from dataset.imagenette import get_imagenette
 
 
 LEVELS = [1, 2, 4, 8, 14]
@@ -61,6 +62,19 @@ def get_cifar10(batch_size=64):
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
     return train_loader, val_loader
+
+
+def get_data(dataset, batch_size=64, num_workers=4):
+    """Get train/val loaders for the specified dataset."""
+    if dataset == "cifar10":
+        return get_cifar10(batch_size)
+    elif dataset == "imagenette":
+        train_loader, val_loader, _ = get_imagenette(
+            batch_size=batch_size, num_workers=num_workers,
+        )
+        return train_loader, val_loader
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
 
 
 # ---- Stage 1: Pretrain model with denoising ----
@@ -336,19 +350,25 @@ def main():
     parser.add_argument("--pretrain_lr", type=float, default=1e-3)
     parser.add_argument("--finetune_lr", type=float, default=1e-3)
     parser.add_argument("--noise_std", type=float, default=0.3)
-    parser.add_argument("--ckpt_dir", type=str, default="./output/cifar10_ckpt")
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenette"])
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--ckpt_dir", type=str, default=None)
     args = parser.parse_args()
+
+    if args.ckpt_dir is None:
+        args.ckpt_dir = f"./output/{args.dataset}_ckpt"
 
     device = get_device()
     print(f"Device: {device}")
 
-    train_loader, val_loader = get_cifar10(args.batch_size)
+    train_loader, val_loader = get_data(args.dataset, args.batch_size, args.num_workers)
 
     fig_dir = os.path.join(os.path.dirname(__file__), "figures")
     os.makedirs(fig_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    log_path = os.path.join(fig_dir, "pretrain_denoise.log")
+    suffix = f"_{args.dataset}" if args.dataset != "cifar10" else ""
+    log_path = os.path.join(fig_dir, f"pretrain_denoise{suffix}.log")
     log_file = open(log_path, "w")
 
     def log(msg):
@@ -356,9 +376,13 @@ def main():
         log_file.write(msg + "\n")
         log_file.flush()
 
+    log(f"Dataset: {args.dataset}")
     log(f"Pretrain: {args.pretrain_epochs} epochs, noise_std={args.noise_std}")
     log(f"Finetune: {args.finetune_epochs} epochs")
     log("")
+
+    num_classes = 10  # both CIFAR-10 and Imagenette have 10 classes
+    ds_tag = args.dataset  # "cifar10" or "imagenette"
 
     # ================================================================
     # Stage 1: Pretrain with denoising
@@ -367,7 +391,9 @@ def main():
     log("Stage 1: Pretraining HiT-Denoise (macro-prefix + denoising)")
     log("=" * 70)
 
-    pt_ckpt = os.path.join(args.ckpt_dir, "hit_denoise_pretrained.pt")
+    pt_ckpt = os.path.join(args.ckpt_dir, f"hit_denoise_pretrained_{ds_tag}.pt")
+    # Fallback for old CIFAR-10 checkpoint without dataset tag
+    pt_ckpt_legacy = os.path.join(args.ckpt_dir, "hit_denoise_pretrained.pt")
 
     torch.manual_seed(42)
     pretrain_model = HiTDenoise(noise_std=args.noise_std).to(device)
@@ -377,6 +403,11 @@ def main():
     if os.path.exists(pt_ckpt):
         log(f"Loading pretrained from {pt_ckpt}")
         ckpt = torch.load(pt_ckpt, map_location=device, weights_only=True)
+        pretrain_model.load_state_dict(ckpt["model"])
+        log(f"  Loaded (epoch={ckpt['epoch']})")
+    elif ds_tag == "cifar10" and os.path.exists(pt_ckpt_legacy):
+        log(f"Loading pretrained from {pt_ckpt_legacy} (legacy)")
+        ckpt = torch.load(pt_ckpt_legacy, map_location=device, weights_only=True)
         pretrain_model.load_state_dict(ckpt["model"])
         log(f"  Loaded (epoch={ckpt['epoch']})")
     else:
@@ -411,7 +442,7 @@ def main():
     log("=" * 70)
 
     torch.manual_seed(42)
-    finetune_model = ViTFinetune(num_classes=10).to(device)
+    finetune_model = ViTFinetune(num_classes=num_classes).to(device)
 
     # Transfer weights from pretrained model
     transferred = transfer_weights(pretrain_model, finetune_model)
@@ -444,7 +475,7 @@ def main():
 
     log(f"\n  Best val_acc: {best_val_acc:.1f}%")
 
-    ft_ckpt = os.path.join(args.ckpt_dir, "hit_denoise_finetuned.pt")
+    ft_ckpt = os.path.join(args.ckpt_dir, f"hit_denoise_finetuned_{ds_tag}.pt")
     torch.save({
         "model": finetune_model.state_dict(),
         "epoch": args.finetune_epochs,
@@ -463,12 +494,12 @@ def main():
     baseline_results = {}
 
     for name, model_cls, ckpt_name in [
-        ("ViT-Tiny", ViTTiny, "vit_tiny_cifar10.pt"),
-        ("HiT-Tiny (macro)", HiTTiny, "hit_tiny_cifar10.pt"),
+        ("ViT-Tiny", ViTTiny, f"vit_tiny_{ds_tag}.pt"),
+        ("HiT-Tiny (macro)", HiTTiny, f"hit_tiny_{ds_tag}.pt"),
     ]:
         ckpt_path = os.path.join(args.ckpt_dir, ckpt_name)
         torch.manual_seed(42)
-        model = model_cls(num_classes=10).to(device)
+        model = model_cls(num_classes=num_classes).to(device)
 
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
@@ -506,7 +537,7 @@ def main():
 
     axes[0].plot(epochs, ft_history["train_loss"], label="Train", linewidth=1.5)
     axes[0].plot(epochs, ft_history["val_loss"], label="Val", linewidth=1.5)
-    axes[0].set_title("Finetune Loss (pretrained denoise → classification)")
+    axes[0].set_title(f"Finetune Loss on {args.dataset} (denoise → classification)")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].legend()
@@ -524,8 +555,9 @@ def main():
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(fig_dir, "pretrain_denoise.png"), dpi=150)
-    log(f"Saved: {fig_dir}/pretrain_denoise.png")
+    plot_path = os.path.join(fig_dir, f"pretrain_denoise{suffix}.png")
+    plt.savefig(plot_path, dpi=150)
+    log(f"Saved: {plot_path}")
 
     log(f"\nLog saved to: {log_path}")
     log("Done.")

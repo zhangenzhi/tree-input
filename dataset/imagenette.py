@@ -56,13 +56,14 @@ def get_imagenette(batch_size=64, data_dir="./data", num_workers=4):
     train_set = datasets.ImageFolder(os.path.join(root, "train"), transform=transform_train)
     val_set = datasets.ImageFolder(os.path.join(root, "val"), transform=transform_val)
 
+    use_pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True,
+        num_workers=num_workers, pin_memory=use_pin_memory, drop_last=True,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=use_pin_memory,
     )
 
     return train_loader, val_loader, 10
