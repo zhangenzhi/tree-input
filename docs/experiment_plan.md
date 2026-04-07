@@ -316,32 +316,50 @@ Singular value spectrum of the residual — determines whether structural knowle
 **Q3: Necessity verification.**
 Remove the internalization subspace from HiT L4 features → does acc drop to ViT level? Proves the identified subspace is necessary, not just correlated.
 
-### 4.8c Imagenette Validation: Macro vs Micro vs Random
+### 4.8c Imagenette Validation: Full Control Experiment Matrix
 
 *Status: done. Script: `analysis/convergence_imagenette.py`*
 
-Replicated the control experiment on Imagenette (10-class ImageNet subset, native high-res 224x224).
+Comprehensive comparison on Imagenette (10-class ImageNet subset, native high-res 224x224). All models use 281 tokens (85 prefix + 196 L4) except ViT (196 only).
 
-| Model | best val_acc | overfit gap | final val_loss |
-|-------|-------------|-------------|----------------|
-| **HiT-macro** | **80.3%** | **7.0%** | 0.66 |
-| ViT | 75.9% | 10.0% | 0.80 |
-| HiT-micro | 68.6% | 31.6% | 2.34 |
-| HiT-random | 65.4% | 34.6% | 2.61 |
+| Model | Prefix content | best val_acc | overfit gap | Embedding overlap with L4 |
+|-------|---------------|-------------|-------------|---------------------------|
+| **HiT-offset (8,8)** | Fixed half-patch shifted grid | **80.7%** | 9.1% | 25% pixel overlap |
+| **HiT-macro** | L0-L3 multi-scale pyramid | **80.3%** | **7.0%** | None (different scale) |
+| HiT-noise | Gaussian random noise | 78.6% | 8.7% | None (random) |
+| ViT | none (196 tokens) | 75.9% | 10.0% | — |
+| HiT-random-PE | L4 duplicates + different PE | ~65% | ~35% | 100% pixel, different PE |
+| HiT-random | L4 duplicates (same PE) | 65.4% | 34.6% | 100% identical |
+| HiT-offset (random) | Random-position 16x16 patches | ~63% | catastrophic | Variable (0-100%) |
+| HiT-micro | 8x8 crops resized to 16x16 | 68.6% | 31.6% | High (~75%) |
 
 #### Findings
 
-**F1: Micro and random prefix catastrophically harm performance on real high-res images.**
-Both fall 7-10% below ViT baseline (68.6% and 65.4% vs 75.9%), with extreme overfitting (gap 31-35%). Val_loss explodes from epoch 20 onwards. This completely reverses the marginal gains seen on CIFAR-10 (77-78%).
+**F1: Offset (8,8) surpasses macro — cross-boundary information is highly valuable.**
+HiT-offset (80.7%) outperforms HiT-macro (80.3%) using only same-scale patches. The standard 14x14 grid creates hard boundaries that lose texture/edge continuity. Offset patches at (8,8) sit at the intersection of 4 L4 neighbors, recovering this cross-boundary information. This is a different type of "genuinely new information" than macro — not multi-scale, but cross-spatial.
 
-**F2: CIFAR-10 results for micro/random were misleading.**
-CIFAR-10 images are 32x32 upscaled to 224x224, so information content is low and any extra tokens provide marginal help. On real high-res data, redundant/overlapping tokens severely dilute attention and accelerate overfitting. CIFAR-10's small image size masked this failure mode.
+**F2: Content redundancy is the root cause of catastrophic overfitting, not softmax identity failure.**
+HiT-random-PE has different PE (softmax can distinguish tokens) but same pixel content → still catastrophic (~65%). HiT-noise has no useful content → no overfitting (78.6%). The mechanism: redundant patch content provides sample-specific texture patterns that the model uses as memorization shortcuts. Softmax identity amplifies this but is not the root cause — the `patch_proj` output dominates the total embedding, so PE differences alone cannot overcome content similarity.
 
-**F3: Macro prefix advantage is robust across datasets.**
-HiT-macro achieves +4.4% over ViT on both CIFAR-10 and Imagenette, with consistently lower overfitting (gap 7% vs 10% on Imagenette). The global structural information provides genuine, dataset-independent regularization.
+**F3: Prefix position stability is a prerequisite for effective learning.**
+Offset (8,8) fixed grid: 80.7%. Offset random positions: ~63% (catastrophic). Same lesson as CIFAR-10 fixed vs random (4.8b). Unstable prefix positions prevent the model from forming reliable cross-attention patterns across training, turning the prefix into noise that accelerates memorization.
 
-**F4: Definitive conclusion on prefix content.**
-The macro prefix's advantage is entirely attributable to cross-patch global structural information. Adding more tokens without genuinely new cross-scale information is actively harmful on real data. This eliminates all alternative explanations (extra compute, ensemble effect, stochastic regularization).
+**F4: Pure noise prefix outperforms ViT by +2.7% — register token effect.**
+HiT-noise (78.6%) > ViT (75.9%) despite carrying zero useful information. The noise tokens act as computational scratch space (similar to "register tokens" in Darcet et al., ICLR 2024), giving the model extra capacity for internal computation without introducing redundant content.
+
+**F5: ~25% pixel overlap is safe; higher overlap triggers overfitting.**
+Offset (8,8) with 25% overlap per neighbor: healthy (80.7%). Random offset with variable 0-100% overlap: catastrophic. Micro (8x8 crops, ~75% overlap): catastrophic. There exists a threshold of embedding similarity above which redundant attention patterns dominate, causing overfitting.
+
+**F6: Three types of "genuinely new information" all work, one dominates.**
+- Macro (multi-scale global structure): 80.3%
+- Offset (cross-boundary spatial detail): **80.7%**
+- Noise (computational workspace): 78.6%
+
+Cross-boundary information at the same scale is at least as valuable as multi-scale global structure. This suggests the L4 grid's patch boundary artifacts are a significant source of information loss in ViT.
+
+#### Practical Implications
+
+**Macro + Offset combination** is a natural next step: L0-L3 for global structure + (8,8)-shifted patches for cross-boundary detail. These provide two orthogonal types of new information and should be additive.
 
 ### 4.8d Imagenette Level Ablation
 
@@ -379,24 +397,37 @@ Train with 281 tokens (80.3%), infer with L4 only 196 tokens (79.8%). Compared t
 
 The internalization pattern is consistent: ~0.5% drop from removing coarse tokens, ~4% advantage over ViT at same inference cost.
 
-### 4.8e Softmax Attention Failure Under Token Redundancy
+### 4.8e Content Redundancy and Attention Degeneration
 
-*Status: noise control pending. Script: `analysis/convergence_imagenette.py --models hit_noise`*
+*Status: done. Script: `analysis/convergence_imagenette.py`*
 
-The catastrophic overfitting of HiT-random and HiT-micro on Imagenette (4.8c) demands a mechanistic explanation. We identify **softmax attention failure under token redundancy** as the root cause.
+The catastrophic overfitting of HiT-random/micro on Imagenette demands a mechanistic explanation. Through a series of control experiments, we identify **patch content redundancy** as the root cause, with embedding similarity as the proximate mechanism.
 
-#### Mechanism
+#### Control Experiments
 
-**Step 1: Identical embeddings.** In HiT-random, prefix tokens are exact copies of L4 patches — same pixel values, same (cx, cy, s) coordinates. After `patch_proj` + PE, their embeddings are **mathematically identical** to the original L4 tokens. Not approximately similar — precisely equal.
+| Model | Content redundant? | PE different? | Emb ~identical? | Overfits? |
+|-------|-------------------|--------------|-----------------|-----------|
+| HiT-random | Yes (exact copy) | No | Yes | **Yes** (65.4%) |
+| HiT-random-PE | Yes (exact copy) | **Yes** | **~Yes** (PE weak) | **Yes** (~65%) |
+| HiT-offset (random pos) | Partial (variable) | Yes | Variable | **Yes** (~63%) |
+| HiT-offset (8,8 fixed) | Partial (25%) | Yes | No | **No** (80.7%) |
+| HiT-noise | No (pure noise) | Yes | No | **No** (78.6%) |
 
-**Step 2: Softmax routing failure.** For any query token q_i attending to all keys, if tokens j (original) and k (duplicate) are identical:
-- k_j = k_k → attention scores q_i·k_j = q_i·k_k (exactly)
-- After softmax: α_j = α_k (forced equal weights)
-- The 85 duplicated spatial positions automatically receive 2x attention weight, regardless of content
+#### Mechanism (revised from initial hypothesis)
 
-Softmax's role is **content-dependent dynamic routing** — deciding where to attend based on what the input contains. For identical token pairs, this routing degenerates into a **fixed amplification pattern**: duplicated positions always get 2x, non-duplicated get 1x. This portion of the attention mechanism becomes MLP-like (fixed, non-adaptive).
+**Initial hypothesis**: Softmax identity failure (identical embeddings → locked attention weights) is the root cause.
 
-**Step 3: Gradient amplification and premature memorization.** The 2x attention weight on duplicated positions doubles their gradient signal. The model descends faster on local texture features of these positions. Training dynamics confirm this:
+**Revised finding**: Content redundancy is the root cause. Softmax identity is an amplifying factor, not the primary driver.
+
+**Evidence**: HiT-random-PE gives duplicate patches different PE, allowing softmax to distinguish them. Yet it still catastrophically overfits (~65%), because `patch_proj` output dominates the total embedding — PE perturbation is too small to overcome content similarity. The tokens remain close in embedding space despite different PE.
+
+**The actual mechanism**:
+
+**Step 1: Content similarity → embedding proximity.** When two patches share >50% pixels, their `patch_proj` outputs are highly correlated. PE contributes a small additive offset, but the total embedding distance remains small. For the attention mechanism, these tokens are effectively near-duplicates.
+
+**Step 2: Near-duplicate tokens provide memorization shortcuts.** The same image region represented twice allows the model to build sample-specific pattern matching: the subtle correlation between a patch and its near-duplicate encodes texture fingerprints unique to each training sample. This is a low-effort, high-reward signal for minimizing training loss — but it doesn't generalize.
+
+**Step 3: Premature memorization overtakes feature learning.** Training dynamics confirm this:
 
 | Model | ep20 train_acc | ep30 train_acc | Speed vs ViT |
 |-------|---------------|---------------|-------------|
@@ -405,40 +436,27 @@ Softmax's role is **content-dependent dynamic routing** — deciding where to at
 | HiT-micro | 72.9% | **86.8%** | ~2x |
 | HiT-random | 72.1% | **86.6%** | ~2x |
 
-Micro/random train 2x faster than ViT at epoch 20-30, but this "acceleration" is entirely memorization — val_loss diverges from epoch 20 onwards. The model skips the global feature learning phase and goes directly into local texture memorization.
+Micro/random reach 86% train accuracy by epoch 30 (ViT: 65%). This "acceleration" is entirely memorization — val_loss diverges from epoch 20. The model skips global feature learning and goes directly into local texture memorization.
 
-**Step 4: Cross-layer self-reinforcement.** Identical input tokens produce identical outputs from layer 1. After residual + MLP, they remain highly similar. Each subsequent layer's attention is again locked on these pairs, compounding the effect. The attention's dynamic capacity is progressively consumed by redundant self-reinforcement.
+**Step 4: Cross-layer self-reinforcement.** Near-identical input tokens produce similar outputs from layer 1. After residual + MLP, they remain highly correlated. Each subsequent layer's attention reinforces this, compounding the effect across depth.
 
-#### Control Experiment: Noise Prefix
+#### Key threshold: ~25% pixel overlap
 
-To verify that softmax failure (not merely extra tokens) is the cause, we add a **noise prefix control**:
-
-| Model | Prefix content | Embedding identical to L4? | Softmax fails? |
-|-------|---------------|---------------------------|----------------|
-| HiT-random | L4 duplicates | Yes (exact) | Yes |
-| HiT-noise | Gaussian noise | No (random) | No |
-| ViT | none | N/A | N/A |
-
-- If HiT-noise overfits far less than HiT-random → **softmax failure is the key mechanism**
-- If HiT-noise overfits similarly → extra tokens/capacity is the cause, not softmax
-
-*Results: pending.*
+Offset (8,8) with 25% overlap per neighbor: healthy (80.7%). Random offset with variable overlap (often >80%): catastrophic. This suggests a threshold of embedding similarity exists, above which redundant attention patterns dominate and trigger memorization.
 
 #### Relation to Prior Work
 
-This mechanism connects to but is distinct from several lines of research:
+1. **Rank collapse in attention** (Dong et al., ICML 2021): Proves pure self-attention converges to rank-1 output. Our finding: redundant *input* tokens accelerate this collapse.
 
-1. **Rank collapse in attention** (Dong et al., ICML 2021): Proves pure self-attention converges to rank-1 output. Our finding is that identical *input* tokens accelerate this collapse.
+2. **Repeated token phenomenon in LLMs** (Yona et al., ICML 2025): Most directly related — shows repeated tokens break attention sink mechanisms in LLMs. We observe the analogous phenomenon in ViT, with overfitting as the consequence.
 
-2. **Repeated token phenomenon in LLMs** (Yona et al., ICML 2025): Most directly related — shows repeated tokens break attention sink mechanisms in LLMs. We observe the analogous phenomenon in ViT, but the consequence is overfitting rather than generation divergence.
+3. **Softmax limitations** (Velickovic et al., NeurIPS 2024): Proves softmax coefficients must disperse as token count grows. Redundant tokens amplify this dilution without adding information.
 
-3. **Softmax limitations** (Velickovic et al., NeurIPS 2024): Proves softmax attention coefficients must disperse as token count grows. Duplicate tokens amplify this dilution without adding information.
+4. **ViTs Need Registers** (Darcet et al., ICLR 2024): Discovers artifact tokens receiving disproportionate attention. Our noise prefix (78.6% > ViT 75.9%) acts as a beneficial register — providing computational workspace without redundant content.
 
-4. **ViTs Need Registers** (Darcet et al., ICLR 2024): Discovers artifact tokens in ViT that receive disproportionate attention. Related to how redundant tokens attract fixed attention weight.
+5. **Attention entropy/rank collapse** (Barbero et al., ICML 2025): Uses RMT to show rank collapse is intrinsic to softmax. Redundant tokens reduce key matrix rank, amplifying the spectral gap.
 
-5. **Attention entropy/rank collapse** (Barbero et al., ICML 2025): Uses Random Matrix Theory to show rank collapse is intrinsic to softmax attention. Duplicate tokens reduce key matrix rank, amplifying the spectral gap.
-
-**Gap in literature**: The complete chain — input-level token duplication → softmax routing failure → gradient amplification → accelerated memorization → catastrophic overfitting — has not been formalized. Each component exists in isolation, but the unified mechanism and its empirical demonstration on ViT classification is novel.
+**Gap in literature**: The complete chain — content redundancy → embedding proximity → memorization shortcuts → catastrophic overfitting — has not been formalized. The critical finding that PE modification alone cannot rescue redundant content (random-PE result) distinguishes this from pure softmax-identity explanations and points to content-level redundancy as the fundamental issue.
 
 ### 4.8f Two-Stage Pretraining: Denoise and MAE
 
@@ -514,6 +532,24 @@ For the same set of images, extract HiT L4 and ViT patch representations at each
 - If high-rank: hierarchical info is deeply entangled with texture/content features, harder to isolate
 - Either result informs the "strong structure" direction — whether structural constraints can be cleanly separated from content, or whether they must be jointly learned
 
+### 4.10 Next: Macro + Offset Combination
+
+*Status: planned.*
+
+HiT-macro (80.3%) and HiT-offset (80.7%) provide two orthogonal types of genuinely new information:
+
+| Source | Information type | Scale | Mechanism |
+|--------|-----------------|-------|-----------|
+| Macro (L0-L3) | Global structure, spatial hierarchy | Multi-scale (coarser than L4) | Top-down structural regularization |
+| Offset (8,8) | Cross-boundary texture continuity | Same scale (16x16, shifted) | Bottom-up boundary recovery |
+
+Since they address different information gaps, their benefits should be **additive**. Proposed experiment:
+
+- **HiT-macro+offset**: L0-L3 (85 tokens) + (8,8)-offset selection (85 tokens) + L4 (196 tokens) = 366 tokens
+- Or reduced: L2-L3 (80 tokens) + offset (85 tokens) + L4 (196 tokens) = 361 tokens (drop L0-L1 which contribute <0.2%)
+
+Expected: >81% on Imagenette if the information is truly orthogonal.
+
 ---
 
 ## 5. Analysis Scripts
@@ -526,7 +562,7 @@ For the same set of images, extract HiT L4 and ViT patch representations at each
 | `analysis/training_dynamics.py` | Per-layer heatmap/entropy/CLS-attn/norms + level ablation | Done |
 | `analysis/linear_probe.py` | Per-layer per-level linear probe for ViT and HiT | Done |
 | `analysis/micro_prefix_probe.py` | Micro/random/fixed prefix control + comparative probe | Done |
-| `analysis/convergence_imagenette.py` | Imagenette convergence: ViT/HiT/micro/random/noise + ablation | Done |
+| `analysis/convergence_imagenette.py` | Imagenette: ViT/HiT/micro/random/noise/offset/random-PE + ablation | Done |
 | `analysis/pretrain_denoise.py` | Two-stage: denoise pretrain + classification finetune | Done |
 | `analysis/pretrain_mae.py` | Two-stage: MAE pretrain (75% mask) + classification finetune | Done |
 | `analysis/attention_distance.py` | Layer-wise attention distance + level attention distribution | Pending |
