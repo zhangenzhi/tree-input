@@ -600,15 +600,25 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         param_count = sum(p.numel() for p in model.parameters())
 
         # Load checkpoint if exists
+        start_epoch = 0
+        best_val_acc = 0.0
         if os.path.exists(ckpt_path):
-            print(f"Loading {name} from {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
             model.load_state_dict(ckpt["model"])
-            print(f"  Loaded (epoch={ckpt['epoch']}, val_acc={ckpt.get('best_val_acc', ckpt.get('val_acc', '?'))}%)")
-            print(f"  Skipping training, using cached results.")
-            results[name] = None  # no history, just checkpoint
-            print()
-            continue
+            ckpt_epoch = ckpt["epoch"]
+            ckpt_val = ckpt.get("best_val_acc", ckpt.get("val_acc", "?"))
+            print(f"Loading {name} from {ckpt_path}")
+            print(f"  Loaded (epoch={ckpt_epoch}, val_acc={ckpt_val}%)")
+
+            if ckpt_epoch >= num_epochs:
+                print(f"  Skipping training, using cached results.")
+                results[name] = None
+                print()
+                continue
+            else:
+                start_epoch = ckpt_epoch
+                best_val_acc = ckpt.get("best_val_acc", 0.0)
+                print(f"  Resuming from epoch {start_epoch} to {num_epochs}...")
 
         print(f"Training {name}...")
         print(f"{'='*60}")
@@ -618,6 +628,9 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=num_epochs
         )
+        # Advance scheduler to correct position if resuming
+        for _ in range(start_epoch):
+            cosine_scheduler.step()
 
         history = {
             "train_loss": [], "train_acc": [],
@@ -625,9 +638,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
             "epoch_time": [],
         }
 
-        best_val_acc = 0.0
-
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             start = time.time()
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, criterion, optimizer, device
@@ -645,7 +656,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
 
-            if (epoch + 1) % 10 == 0 or epoch == 0:
+            if (epoch + 1) % 10 == 0 or epoch == start_epoch:
                 print(f"  Epoch {epoch+1:3d}/{num_epochs} | "
                       f"train_loss={train_loss:.4f} train_acc={train_acc:.1f}% | "
                       f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}% | "
