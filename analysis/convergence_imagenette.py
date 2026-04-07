@@ -269,6 +269,86 @@ class HiTRandomPETiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTOffsetTiny(nn.Module):
+    """HiT with offset-prefix: 85 non-grid-aligned 16x16 patches + 196 standard patches.
+
+    Patches are randomly positioned (not on the 14x14 grid), so they contain real
+    image content that partially overlaps with but is NOT identical to L4 patches.
+    Tests whether non-redundant same-scale extra tokens provide useful information.
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, num_offset=NUM_MICRO):
+        super().__init__()
+        self.num_offset = num_offset
+        self.patch_size = 16
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def _extract_offset_patches(self, images):
+        """Extract 16x16 patches at random non-grid positions."""
+        B, C, H, W = images.shape
+        P = self.patch_size
+
+        if self.training:
+            # Random float positions (not aligned to 16-pixel grid)
+            top = torch.randint(0, H - P + 1, (self.num_offset,))
+            left = torch.randint(0, W - P + 1, (self.num_offset,))
+        else:
+            torch.manual_seed(0)
+            top = torch.randint(0, H - P + 1, (self.num_offset,))
+            left = torch.randint(0, W - P + 1, (self.num_offset,))
+
+        patches = []
+        coords = []
+        for i in range(self.num_offset):
+            t, l = top[i].item(), left[i].item()
+            patch = images[:, :, t:t+P, l:l+P]  # [B, C, P, P]
+            patches.append(patch.reshape(B, -1))  # [B, C*P*P]
+            cx = (l + P / 2) / W
+            cy = (t + P / 2) / H
+            s = P / H  # same scale as L4: 16/224
+            coords.append([cx, cy, s])
+
+        patches = torch.stack(patches, dim=1)  # [B, num_offset, C*P*P]
+        coords = torch.tensor(coords, dtype=torch.float32)
+        return patches, coords
+
+    def forward(self, images):
+        B = images.size(0)
+
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+        offset_patches, offset_coords = self._extract_offset_patches(images)
+        offset_coords = offset_coords.to(images.device)
+
+        all_patches = torch.cat([offset_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([offset_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
 class HiTNoiseTiny(nn.Module):
     """HiT with noise-prefix: 85 Gaussian noise patches + 196 standard patches.
 
@@ -392,6 +472,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         "hit_random": ("HiT-random", HiTRandomTiny, "hit_random_tiny_imagenette.pt"),
         "hit_noise": ("HiT-noise", HiTNoiseTiny, "hit_noise_tiny_imagenette.pt"),
         "hit_random_pe": ("HiT-random-PE", HiTRandomPETiny, "hit_random_pe_tiny_imagenette.pt"),
+        "hit_offset": ("HiT-offset", HiTOffsetTiny, "hit_offset_tiny_imagenette.pt"),
     }
 
     if models == "all":
