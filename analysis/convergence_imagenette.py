@@ -208,6 +208,67 @@ class HiTRandomTiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTRandomPETiny(nn.Module):
+    """HiT with random-prefix + different PE: 85 duplicated L4 patches but with
+    modified positional encoding (s offset to -1) so embeddings are NOT identical.
+
+    Same redundant content as HiT-random, but softmax can distinguish original vs duplicate.
+    Tests whether softmax identity failure or information redundancy causes overfitting.
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, num_random=NUM_MICRO):
+        super().__init__()
+        self.num_random = num_random
+        self.patch_size = 16
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def forward(self, images):
+        B = images.size(0)
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+
+        if self.training:
+            indices = torch.randint(0, 196, (self.num_random,))
+        else:
+            torch.manual_seed(0)
+            indices = torch.randint(0, 196, (self.num_random,))
+
+        random_patches = fine_patches[:, indices, :]
+
+        # Same (cx, cy) as original, but s = -1 to mark as "duplicate level"
+        # This makes PE different from original L4 tokens → breaks embedding identity
+        random_coords = self.fine_coords[indices].clone()
+        random_coords[:, 2] = -1.0  # s dimension offset
+
+        all_patches = torch.cat([random_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([random_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
 class HiTNoiseTiny(nn.Module):
     """HiT with noise-prefix: 85 Gaussian noise patches + 196 standard patches.
 
@@ -330,6 +391,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         "hit_micro": ("HiT-micro", HiTMicroTiny, "hit_micro_tiny_imagenette.pt"),
         "hit_random": ("HiT-random", HiTRandomTiny, "hit_random_tiny_imagenette.pt"),
         "hit_noise": ("HiT-noise", HiTNoiseTiny, "hit_noise_tiny_imagenette.pt"),
+        "hit_random_pe": ("HiT-random-PE", HiTRandomPETiny, "hit_random_pe_tiny_imagenette.pt"),
     }
 
     if models == "all":
