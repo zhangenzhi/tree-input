@@ -415,6 +415,101 @@ class HiTNoiseTiny(nn.Module):
         return self.head(x[:, 0])
 
 
+class HiTMacroOffsetTiny(nn.Module):
+    """HiT with macro + offset: L0-L3 pyramid (85) + (8,8)-offset patches (85) + L4 (196).
+
+    Combines two orthogonal sources of genuinely new information:
+    - Macro (L0-L3): global multi-scale structure (top-down)
+    - Offset (8,8): cross-boundary texture continuity (bottom-up)
+    Total: 1 CLS + 85 macro + 85 offset + 196 L4 = 367 tokens.
+    """
+
+    def __init__(self, num_classes=NUM_CLASSES, levels=None, num_offset=NUM_MICRO):
+        super().__init__()
+        self.levels = levels or LEVELS
+        self.total_macro = sum(n * n for n in self.levels[:-1])  # 85
+        self.num_offset = num_offset
+        self.patch_size = 16
+        self.offset = 8
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+        self.embed_dim = vit.embed_dim
+
+        self.patch_proj = nn.Linear(16 * 16 * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        # Macro coords (L0-L3)
+        macro_coords = build_pyramid_coords(self.levels[:-1])  # [85, 3]
+        self.register_buffer("macro_coords", macro_coords)
+
+        # Fine coords (L4)
+        fine_coords = build_pyramid_coords([14])  # [196, 3]
+        self.register_buffer("fine_coords", fine_coords)
+
+        # Offset grid: 13x13 positions at (8,8) shift, select 85
+        offset_positions = []
+        for row in range(13):
+            for col in range(13):
+                t = self.offset + row * self.patch_size
+                l = self.offset + col * self.patch_size
+                offset_positions.append((t, l))
+        torch.manual_seed(42)
+        perm = torch.randperm(len(offset_positions))[:num_offset]
+        self.offset_positions = [offset_positions[i] for i in perm]
+
+        offset_coords = []
+        for t, l in self.offset_positions:
+            cx = (l + self.patch_size / 2) / 224.0
+            cy = (t + self.patch_size / 2) / 224.0
+            s = self.patch_size / 224.0
+            offset_coords.append([cx, cy, s])
+        self.register_buffer("offset_coords", torch.tensor(offset_coords, dtype=torch.float32))
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = vit.head
+
+    def _extract_offset_patches(self, images):
+        B = images.size(0)
+        P = self.patch_size
+        patches = []
+        for t, l in self.offset_positions:
+            patch = images[:, :, t:t+P, l:l+P]
+            patches.append(patch.reshape(B, -1))
+        return torch.stack(patches, dim=1)
+
+    def forward(self, images):
+        B = images.size(0)
+
+        # Macro patches (L0-L3)
+        macro_patches = extract_pyramid_patches(images, self.levels[:-1], self.patch_size)
+        # Offset patches (8,8 shifted grid)
+        offset_patches = self._extract_offset_patches(images)
+        # Fine patches (L4)
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+
+        # Concatenate: [macro | offset | fine]
+        all_patches = torch.cat([macro_patches, offset_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        # PE
+        all_coords = torch.cat([self.macro_coords, self.offset_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        # CLS
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
 # ---- Training ----
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -479,6 +574,7 @@ def run_experiment(num_epochs=100, batch_size=64, lr=1e-3, data_dir="./data",
         "hit_noise": ("HiT-noise", HiTNoiseTiny, "hit_noise_tiny_imagenette.pt"),
         "hit_random_pe": ("HiT-random-PE", HiTRandomPETiny, "hit_random_pe_tiny_imagenette.pt"),
         "hit_offset": ("HiT-offset", HiTOffsetTiny, "hit_offset_tiny_imagenette.pt"),
+        "hit_macro_offset": ("HiT-macro+offset", HiTMacroOffsetTiny, "hit_macro_offset_tiny_imagenette.pt"),
     }
 
     if models == "all":
