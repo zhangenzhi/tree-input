@@ -270,17 +270,21 @@ class HiTRandomPETiny(nn.Module):
 
 
 class HiTOffsetTiny(nn.Module):
-    """HiT with offset-prefix: 85 non-grid-aligned 16x16 patches + 196 standard patches.
+    """HiT with offset-prefix: 85 fixed-offset 16x16 patches + 196 standard patches.
 
-    Patches are randomly positioned (not on the 14x14 grid), so they contain real
-    image content that partially overlaps with but is NOT identical to L4 patches.
+    Patches are shifted by (8, 8) pixels from the 14x14 grid, landing at the
+    intersection of 4 neighboring L4 patches. They contain real image content
+    that partially overlaps with L4 but is NOT identical.
     Tests whether non-redundant same-scale extra tokens provide useful information.
+
+    Offset grid: 13x13 = 169 positions available, randomly select 85.
     """
 
     def __init__(self, num_classes=NUM_CLASSES, num_offset=NUM_MICRO):
         super().__init__()
         self.num_offset = num_offset
         self.patch_size = 16
+        self.offset = 8  # half-patch shift
 
         vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
         self.embed_dim = vit.embed_dim
@@ -292,6 +296,28 @@ class HiTOffsetTiny(nn.Module):
         fine_coords = build_pyramid_coords([14])
         self.register_buffer("fine_coords", fine_coords)
 
+        # Precompute the offset grid: 13x13 positions starting at (8, 8) with stride 16
+        # These sit exactly at the intersection of 4 neighboring L4 patches
+        offset_positions = []
+        for row in range(13):
+            for col in range(13):
+                t = self.offset + row * self.patch_size
+                l = self.offset + col * self.patch_size
+                offset_positions.append((t, l))
+        # Fixed random selection of 85 from 169
+        torch.manual_seed(42)
+        perm = torch.randperm(len(offset_positions))[:num_offset]
+        self.offset_positions = [offset_positions[i] for i in perm]
+
+        # Precompute PE coords for offset patches
+        offset_coords = []
+        for t, l in self.offset_positions:
+            cx = (l + self.patch_size / 2) / 224.0
+            cy = (t + self.patch_size / 2) / 224.0
+            s = self.patch_size / 224.0
+            offset_coords.append([cx, cy, s])
+        self.register_buffer("offset_coords", torch.tensor(offset_coords, dtype=torch.float32))
+
         self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_drop = vit.pos_drop
         self.blocks = vit.blocks
@@ -299,45 +325,25 @@ class HiTOffsetTiny(nn.Module):
         self.head = vit.head
 
     def _extract_offset_patches(self, images):
-        """Extract 16x16 patches at random non-grid positions."""
-        B, C, H, W = images.shape
+        """Extract 16x16 patches at fixed (8,8)-offset grid positions."""
+        B = images.size(0)
         P = self.patch_size
-
-        if self.training:
-            # Random float positions (not aligned to 16-pixel grid)
-            top = torch.randint(0, H - P + 1, (self.num_offset,))
-            left = torch.randint(0, W - P + 1, (self.num_offset,))
-        else:
-            torch.manual_seed(0)
-            top = torch.randint(0, H - P + 1, (self.num_offset,))
-            left = torch.randint(0, W - P + 1, (self.num_offset,))
-
         patches = []
-        coords = []
-        for i in range(self.num_offset):
-            t, l = top[i].item(), left[i].item()
+        for t, l in self.offset_positions:
             patch = images[:, :, t:t+P, l:l+P]  # [B, C, P, P]
-            patches.append(patch.reshape(B, -1))  # [B, C*P*P]
-            cx = (l + P / 2) / W
-            cy = (t + P / 2) / H
-            s = P / H  # same scale as L4: 16/224
-            coords.append([cx, cy, s])
-
-        patches = torch.stack(patches, dim=1)  # [B, num_offset, C*P*P]
-        coords = torch.tensor(coords, dtype=torch.float32)
-        return patches, coords
+            patches.append(patch.reshape(B, -1))
+        return torch.stack(patches, dim=1)  # [B, num_offset, C*P*P]
 
     def forward(self, images):
         B = images.size(0)
 
         fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
-        offset_patches, offset_coords = self._extract_offset_patches(images)
-        offset_coords = offset_coords.to(images.device)
+        offset_patches = self._extract_offset_patches(images)
 
         all_patches = torch.cat([offset_patches, fine_patches], dim=1)
         x = self.patch_proj(all_patches)
 
-        all_coords = torch.cat([offset_coords, self.fine_coords], dim=0)
+        all_coords = torch.cat([self.offset_coords, self.fine_coords], dim=0)
         pe = self.pe(all_coords)
         x = x + pe.unsqueeze(0)
 
