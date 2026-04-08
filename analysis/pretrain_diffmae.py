@@ -162,15 +162,81 @@ class TimestepEmbedding(nn.Module):
 
 # ---- Stage 1: DiffMAE model ----
 
-class HiTDiffMAE(nn.Module):
-    """HiT with macro-prefix + MAE masking + diffusion reconstruction of offset patches.
+class DiffusionDecoder(nn.Module):
+    """Lightweight transformer decoder for diffusion reconstruction.
 
-    Encoder: processes L0-L3 (visible) + visible L4 + mask tokens
-    Reconstruction: for masked L4 positions, predict (8,8)-offset patch pixels
-                    conditioned on encoder output + diffusion timestep
+    Takes encoder latent + noised target tokens + timestep as input,
+    runs through a few transformer layers, and predicts clean pixels.
+    Following DiffMAE (Wei et al., 2023): decoder is separate and lightweight.
     """
 
-    def __init__(self, levels=None, mask_ratio=0.75, diff_timesteps=1000):
+    def __init__(self, embed_dim=192, decoder_dim=96, decoder_depth=4,
+                 decoder_heads=3, patch_pixels=PATCH_SIZE * PATCH_SIZE * 3):
+        super().__init__()
+        self.decoder_dim = decoder_dim
+
+        # Project encoder features to decoder dim
+        self.enc_proj = nn.Linear(embed_dim, decoder_dim)
+
+        # Project noised target pixels to decoder dim
+        self.noise_proj = nn.Linear(patch_pixels, decoder_dim)
+
+        # Timestep embedding
+        self.time_embed = TimestepEmbedding(decoder_dim)
+
+        # Transformer decoder blocks
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=decoder_dim, nhead=decoder_heads,
+            dim_feedforward=decoder_dim * 4, dropout=0.0,
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.decoder_blocks = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
+        self.decoder_norm = nn.LayerNorm(decoder_dim)
+
+        # Predict clean pixels
+        self.pixel_head = nn.Linear(decoder_dim, patch_pixels)
+
+    def forward(self, encoder_features, noised_pixels, t):
+        """
+        Args:
+            encoder_features: [B, num_masked, embed_dim] from encoder
+            noised_pixels: [B, num_masked, patch_pixels] noised reconstruction targets
+            t: [B] integer timesteps
+        Returns:
+            pred_pixels: [B, num_masked, patch_pixels] predicted clean pixels
+        """
+        B, N, _ = encoder_features.shape
+
+        # Project inputs to decoder dim
+        enc_tokens = self.enc_proj(encoder_features)  # [B, N, decoder_dim]
+        noise_tokens = self.noise_proj(noised_pixels)  # [B, N, decoder_dim]
+
+        # Timestep embedding broadcast to all tokens
+        t_emb = self.time_embed(t).unsqueeze(1).expand(-1, N, -1)  # [B, N, decoder_dim]
+
+        # Combine: encoder condition + noised input + timestep
+        x = enc_tokens + noise_tokens + t_emb  # [B, N, decoder_dim]
+
+        # Transformer decoder
+        x = self.decoder_blocks(x)
+        x = self.decoder_norm(x)
+
+        # Predict clean pixels
+        return self.pixel_head(x)
+
+
+class HiTDiffMAE(nn.Module):
+    """HiT with macro-prefix + MAE masking + diffusion decoder for offset reconstruction.
+
+    Following DiffMAE (Wei et al., ICCV 2023):
+    - Encoder: processes L0-L3 (visible) + visible L4 + mask tokens
+    - Decoder: lightweight transformer that iteratively denoises offset patches
+      conditioned on encoder output + timestep
+    - Encoder learns high-quality latents because decoder demands it for denoising
+    """
+
+    def __init__(self, levels=None, mask_ratio=0.75, diff_timesteps=1000,
+                 decoder_dim=96, decoder_depth=4):
         super().__init__()
         self.levels = levels or LEVELS
         self.patch_size = PATCH_SIZE
@@ -199,16 +265,10 @@ class HiTDiffMAE(nn.Module):
         self.blocks = vit.blocks
         self.norm = vit.norm
 
-        # Timestep embedding
-        self.time_embed = TimestepEmbedding(self.embed_dim)
-
-        # Reconstruction head: encoder_features + timestep -> clean offset pixels
-        self.recon_head = nn.Sequential(
-            nn.Linear(self.embed_dim * 2, self.embed_dim),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, PATCH_SIZE * PATCH_SIZE * 3),
+        # Diffusion decoder (separate lightweight transformer)
+        self.decoder = DiffusionDecoder(
+            embed_dim=self.embed_dim, decoder_dim=decoder_dim,
+            decoder_depth=decoder_depth, decoder_heads=3,
         )
 
         # Diffusion schedule
@@ -216,7 +276,6 @@ class HiTDiffMAE(nn.Module):
         self.diff_timesteps = diff_timesteps
 
         # Precompute which L4 positions have valid offset patches (13x13 inner grid)
-        # L4 grid: 14 rows x 14 cols. Offset at (row*16+8, col*16+8) is valid for row<13, col<13
         valid_mask = torch.zeros(14, 14, dtype=torch.bool)
         valid_mask[:13, :13] = True
         self.register_buffer("valid_offset_mask", valid_mask.flatten())  # [196]
@@ -302,31 +361,31 @@ class HiTDiffMAE(nn.Module):
         x = self.blocks(x)
         x = self.norm(x)
 
-        # Extract masked position features
+        # Extract masked position features from encoder
         l4_start = 1 + self.num_coarse
         l4_features = x[:, l4_start:l4_start + self.num_fine, :]
         masked_features = l4_features[:, mask_indices, :]  # [B, num_masked, embed_dim]
 
+        # Filter to valid offset positions before decoder (saves compute)
+        valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+        if len(valid_idx) == 0:
+            dummy = torch.zeros(B, 0, 3 * self.patch_size * self.patch_size, device=device)
+            return dummy, dummy, 0
+
+        valid_features = masked_features[:, valid_idx, :]  # [B, num_valid, embed_dim]
+        valid_targets = offset_targets[:, valid_idx, :]  # [B, num_valid, 3*P*P]
+
         # Sample diffusion timestep
         t = torch.randint(0, self.diff_timesteps, (B,), device=device)
 
-        # Add noise to offset targets
+        # Add noise to valid offset targets
         self.diff_schedule.to(device)
-        noised_targets, noise = self.diff_schedule.q_sample(offset_targets, t)
+        noised_targets, noise = self.diff_schedule.q_sample(valid_targets, t)
 
-        # Timestep embedding: [B, embed_dim] -> [B, 1, embed_dim] -> broadcast to [B, num_masked, embed_dim]
-        t_emb = self.time_embed(t).unsqueeze(1).expand(-1, num_masked, -1)
+        # Diffusion decoder: encoder features + noised pixels + timestep -> clean pixels
+        pred_x0 = self.decoder(valid_features, noised_targets, t)
 
-        # Predict clean offset pixels: condition on encoder features + timestep
-        recon_input = torch.cat([masked_features, t_emb], dim=-1)  # [B, num_masked, 2*embed_dim]
-        pred_x0 = self.recon_head(recon_input)  # [B, num_masked, 3*P*P]
-
-        # Filter to valid offset positions only
-        valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-        pred_valid = pred_x0[:, valid_idx, :]
-        target_valid = offset_targets[:, valid_idx, :]
-
-        return pred_valid, target_valid, len(valid_idx)
+        return pred_x0, valid_targets, len(valid_idx)
 
 
 # ---- Stage 2: Finetune (same as pretrain_mae.py) ----
