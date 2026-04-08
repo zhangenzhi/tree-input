@@ -236,7 +236,7 @@ class HiTDiffMAE(nn.Module):
     """
 
     def __init__(self, levels=None, mask_ratio=0.75, diff_timesteps=1000,
-                 decoder_dim=96, decoder_depth=4):
+                 decoder_dim=96, decoder_depth=4, recon_target="offset"):
         super().__init__()
         self.levels = levels or LEVELS
         self.patch_size = PATCH_SIZE
@@ -244,6 +244,7 @@ class HiTDiffMAE(nn.Module):
         self.num_fine = NUM_FINE
         self.num_coarse = sum(n * n for n in self.levels[:-1])  # 85
         self.offset = OFFSET
+        self.recon_target = recon_target  # "offset" or "l4"
 
         vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10)
         self.embed_dim = vit.embed_dim  # 192
@@ -338,8 +339,14 @@ class HiTDiffMAE(nn.Module):
         # Random mask
         mask_indices, visible_indices, num_masked = self.random_mask(B, device)
 
-        # Extract offset targets for masked positions
-        offset_targets, valid_mask = self._extract_offset_targets(images, mask_indices)
+        # Get reconstruction targets
+        if self.recon_target == "offset":
+            recon_targets, valid_mask = self._extract_offset_targets(images, mask_indices)
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+        else:
+            # L4: reconstruct masked patches themselves (original DiffMAE style)
+            recon_targets = fine_patches[:, mask_indices, :]  # [B, num_masked, C*P*P]
+            valid_idx = torch.arange(num_masked, device=device)
 
         # Encode
         coarse_emb = self.patch_proj(coarse_patches)
@@ -366,19 +373,18 @@ class HiTDiffMAE(nn.Module):
         l4_features = x[:, l4_start:l4_start + self.num_fine, :]
         masked_features = l4_features[:, mask_indices, :]  # [B, num_masked, embed_dim]
 
-        # Filter to valid offset positions before decoder (saves compute)
-        valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+        # Filter to valid positions
         if len(valid_idx) == 0:
             dummy = torch.zeros(B, 0, 3 * self.patch_size * self.patch_size, device=device)
             return dummy, dummy, 0
 
-        valid_features = masked_features[:, valid_idx, :]  # [B, num_valid, embed_dim]
-        valid_targets = offset_targets[:, valid_idx, :]  # [B, num_valid, 3*P*P]
+        valid_features = masked_features[:, valid_idx, :]
+        valid_targets = recon_targets[:, valid_idx, :]
 
         # Sample diffusion timestep
         t = torch.randint(0, self.diff_timesteps, (B,), device=device)
 
-        # Add noise to valid offset targets
+        # Add noise to targets
         self.diff_schedule.to(device)
         noised_targets, noise = self.diff_schedule.q_sample(valid_targets, t)
 
@@ -645,6 +651,8 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, default=None)
     parser.add_argument("--finetune_with_offset", action="store_true",
                         help="Finetune with L4 + offset patches (282 tokens) instead of L4 only (196)")
+    parser.add_argument("--recon_target", type=str, default="offset", choices=["offset", "l4"],
+                        help="Reconstruction target: 'offset' (cross-boundary) or 'l4' (same-position)")
     args = parser.parse_args()
 
     if args.ckpt_dir is None:
@@ -660,7 +668,8 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     ds_tag = args.dataset
-    log_path = os.path.join(fig_dir, f"pretrain_diffmae_{ds_tag}.log")
+    rt_tag = args.recon_target  # "offset" or "l4"
+    log_path = os.path.join(fig_dir, f"pretrain_diffmae_{rt_tag}_{ds_tag}.log")
     log_file = open(log_path, "w")
 
     def log(msg):
@@ -668,12 +677,13 @@ def main():
         log_file.write(msg + "\n")
         log_file.flush()
 
+    recon_desc = "(8,8)-offset patches (cross-boundary)" if rt_tag == "offset" else "L4 patches (same-position)"
     log(f"Dataset: {ds_tag}")
     log(f"Pretrain: {args.pretrain_epochs} epochs, mask_ratio={args.mask_ratio}, "
         f"diff_timesteps={args.diff_timesteps}")
     log(f"Finetune: {args.finetune_epochs} epochs")
     log(f"Pretrain LR: {args.pretrain_lr}, Finetune LR: {args.finetune_lr}")
-    log(f"Reconstruction target: (8,8)-offset patches (cross-boundary detail)")
+    log(f"Reconstruction target: {recon_desc}")
     log("")
 
     num_classes = 10
@@ -683,21 +693,26 @@ def main():
     # ================================================================
     log("=" * 70)
     log(f"Stage 1: DiffMAE Pretraining (macro + {args.mask_ratio:.0%} mask + "
-        f"diffusion offset reconstruction)")
+        f"diffusion {rt_tag} reconstruction)")
     log("=" * 70)
 
-    pt_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_pretrained_{ds_tag}.pt")
+    pt_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_{rt_tag}_pretrained_{ds_tag}.pt")
 
     torch.manual_seed(42)
     pretrain_model = HiTDiffMAE(
-        mask_ratio=args.mask_ratio, diff_timesteps=args.diff_timesteps
+        mask_ratio=args.mask_ratio, diff_timesteps=args.diff_timesteps,
+        recon_target=rt_tag,
     ).to(device)
     param_count = sum(p.numel() for p in pretrain_model.parameters())
     log(f"Parameters: {param_count:,}")
     num_masked = int(NUM_FINE * args.mask_ratio)
-    num_valid_offset = min(num_masked, 13 * 13)  # at most 169 valid offset positions
-    log(f"L4 patches: {NUM_FINE}, masked: {num_masked}, "
-        f"valid offset targets: up to {num_valid_offset}")
+    if rt_tag == "offset":
+        num_valid = min(num_masked, 13 * 13)
+        log(f"L4 patches: {NUM_FINE}, masked: {num_masked}, "
+            f"valid offset targets: up to {num_valid}")
+    else:
+        log(f"L4 patches: {NUM_FINE}, masked: {num_masked}, "
+            f"recon targets: {num_masked} (same-position L4)")
     log(f"Macro tokens (L0-L3): {sum(n*n for n in LEVELS[:-1])} (always visible)")
 
     pretrain_history = []
@@ -793,7 +808,7 @@ def main():
 
     log(f"\n  Best val_acc: {best_val_acc:.1f}%")
 
-    ft_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_finetuned_{ft_tag}_{ds_tag}.pt")
+    ft_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_{rt_tag}_finetuned_{ft_tag}_{ds_tag}.pt")
     torch.save({
         "model": finetune_model.state_dict(),
         "epoch": args.finetune_epochs,
@@ -919,11 +934,11 @@ def main():
 
     plt.suptitle(f"HiT-DiffMAE on {ds_tag}", fontsize=14)
     plt.tight_layout()
-    plot_path = os.path.join(fig_dir, f"pretrain_diffmae_{ds_tag}.png")
+    plot_path = os.path.join(fig_dir, f"pretrain_diffmae_{rt_tag}_{ds_tag}.png")
     plt.savefig(plot_path, dpi=150)
     log(f"\nSaved: {plot_path}")
 
-    json_path = os.path.join(fig_dir, f"pretrain_diffmae_{ds_tag}.json")
+    json_path = os.path.join(fig_dir, f"pretrain_diffmae_{rt_tag}_{ds_tag}.json")
     with open(json_path, "w") as f:
         json.dump({
             "pretrain_history": pretrain_history,
