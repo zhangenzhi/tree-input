@@ -365,6 +365,82 @@ class ViTFinetune(nn.Module):
         return self.head(x[:, 0])
 
 
+class OffsetFinetune(nn.Module):
+    """Finetune with L4 + (8,8)-offset patches. Uses DiffMAE-pretrained weights.
+    Total: 1 CLS + 85 offset + 196 L4 = 282 tokens.
+    """
+
+    def __init__(self, num_classes=10, num_offset=NUM_MICRO):
+        super().__init__()
+        self.patch_size = PATCH_SIZE
+        self.embed_dim = 192
+        self.num_offset = num_offset
+        self.offset = OFFSET
+
+        vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=num_classes)
+
+        self.patch_proj = nn.Linear(PATCH_SIZE * PATCH_SIZE * 3, self.embed_dim)
+        self.cls_token = vit.cls_token
+        self.pe = ContinuousPE3D(self.embed_dim, num_freq=32)
+
+        fine_coords = build_pyramid_coords([14])
+        self.register_buffer("fine_coords", fine_coords)
+
+        # Offset grid: 13x13, select 85
+        offset_positions = []
+        for row in range(13):
+            for col in range(13):
+                t = self.offset + row * PATCH_SIZE
+                l = self.offset + col * PATCH_SIZE
+                offset_positions.append((t, l))
+        torch.manual_seed(42)
+        perm = torch.randperm(len(offset_positions))[:num_offset]
+        self.offset_positions = [offset_positions[i] for i in perm]
+
+        offset_coords = []
+        for t, l in self.offset_positions:
+            cx = (l + PATCH_SIZE / 2) / 224.0
+            cy = (t + PATCH_SIZE / 2) / 224.0
+            s = PATCH_SIZE / 224.0
+            offset_coords.append([cx, cy, s])
+        self.register_buffer("offset_coords", torch.tensor(offset_coords, dtype=torch.float32))
+
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = vit.pos_drop
+        self.blocks = vit.blocks
+        self.norm = vit.norm
+        self.head = nn.Linear(self.embed_dim, num_classes)
+
+    def _extract_offset_patches(self, images):
+        B = images.size(0)
+        P = self.patch_size
+        patches = []
+        for t, l in self.offset_positions:
+            patch = images[:, :, t:t+P, l:l+P]
+            patches.append(patch.reshape(B, -1))
+        return torch.stack(patches, dim=1)
+
+    def forward(self, images):
+        B = images.size(0)
+
+        fine_patches = extract_pyramid_patches(images, [14], self.patch_size)
+        offset_patches = self._extract_offset_patches(images)
+
+        all_patches = torch.cat([offset_patches, fine_patches], dim=1)
+        x = self.patch_proj(all_patches)
+
+        all_coords = torch.cat([self.offset_coords, self.fine_coords], dim=0)
+        pe = self.pe(all_coords)
+        x = x + pe.unsqueeze(0)
+
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.cls_pos
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
 # ---- Baselines ----
 
 class ViTTiny(nn.Module):
@@ -507,6 +583,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="imagenette", choices=["cifar10", "imagenette"])
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ckpt_dir", type=str, default=None)
+    parser.add_argument("--finetune_with_offset", action="store_true",
+                        help="Finetune with L4 + offset patches (282 tokens) instead of L4 only (196)")
     args = parser.parse_args()
 
     if args.ckpt_dir is None:
@@ -602,15 +680,23 @@ def main():
         log(f"  Saved: {pt_ckpt}")
 
     # ================================================================
-    # Stage 2: Finetune (L4 only)
+    # Stage 2: Finetune
     # ================================================================
     log("")
     log("=" * 70)
-    log("Stage 2: Finetuning (L4 only, DiffMAE-pretrained weights)")
+    if args.finetune_with_offset:
+        log("Stage 2: Finetuning (L4 + offset patches, DiffMAE-pretrained weights)")
+        ft_tag = "offset"
+    else:
+        log("Stage 2: Finetuning (L4 only, DiffMAE-pretrained weights)")
+        ft_tag = "l4only"
     log("=" * 70)
 
     torch.manual_seed(42)
-    finetune_model = ViTFinetune(num_classes=num_classes).to(device)
+    if args.finetune_with_offset:
+        finetune_model = OffsetFinetune(num_classes=num_classes).to(device)
+    else:
+        finetune_model = ViTFinetune(num_classes=num_classes).to(device)
     transferred = transfer_weights(pretrain_model, finetune_model)
     log(f"  Transferred {len(transferred)} weight tensors from pretrained model")
 
@@ -647,7 +733,7 @@ def main():
 
     log(f"\n  Best val_acc: {best_val_acc:.1f}%")
 
-    ft_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_finetuned_{ds_tag}.pt")
+    ft_ckpt = os.path.join(args.ckpt_dir, f"hit_diffmae_finetuned_{ft_tag}_{ds_tag}.pt")
     torch.save({
         "model": finetune_model.state_dict(),
         "epoch": args.finetune_epochs,
@@ -700,20 +786,21 @@ def main():
     # ================================================================
     # Summary
     # ================================================================
+    ft_tokens = "282 (L4+offset)" if args.finetune_with_offset else "196 (L4 only)"
     log("")
     log("=" * 70)
-    log("SUMMARY (all using 196 tokens at inference)")
+    log(f"SUMMARY (finetune: {ft_tokens})")
     log("=" * 70)
 
     if "ViT-Tiny" in baseline_results:
-        log(f"  ViT-Tiny (from scratch):            {baseline_results['ViT-Tiny']:.1f}%")
+        log(f"  ViT-Tiny (from scratch, 196):       {baseline_results['ViT-Tiny']:.1f}%")
     if "HiT-Tiny (macro)" in baseline_results:
-        log(f"  HiT-Tiny macro (full):              {baseline_results['HiT-Tiny (macro)']:.1f}%")
+        log(f"  HiT-Tiny macro (282):               {baseline_results['HiT-Tiny (macro)']:.1f}%")
     if "HiT-denoise" in baseline_results:
-        log(f"  HiT-denoise (pretrain→finetune):    {baseline_results['HiT-denoise']:.1f}%")
+        log(f"  HiT-denoise (pretrain→ft, 196):     {baseline_results['HiT-denoise']:.1f}%")
     if "HiT-MAE" in baseline_results:
-        log(f"  HiT-MAE (pretrain→finetune):        {baseline_results['HiT-MAE']:.1f}%")
-    log(f"  HiT-DiffMAE (pretrain→finetune):    {best_val_acc:.1f}%")
+        log(f"  HiT-MAE (pretrain→ft, 196):         {baseline_results['HiT-MAE']:.1f}%")
+    log(f"  HiT-DiffMAE (pretrain→ft, {ft_tokens}): {best_val_acc:.1f}%")
     log("")
 
     if "ViT-Tiny" in baseline_results:
