@@ -47,6 +47,7 @@ from dataset.imagenette import get_imagenette
 LEVELS = [1, 2, 4, 8, 14]
 PATCH_SIZE = 16
 NUM_FINE = 14 * 14  # 196
+NUM_MICRO = 85  # number of prefix tokens (same as L0-L3 total)
 OFFSET = 8  # half-patch shift
 
 
