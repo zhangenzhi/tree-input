@@ -812,6 +812,157 @@ def run_ablation(batch_size=64, data_dir="./data", num_workers=4):
     print("=" * 60)
 
 
+def run_offset_ablation(batch_size=64, data_dir="./data", num_workers=4):
+    """Offset ablation: load HiT-offset checkpoint, evaluate with/without offset tokens."""
+    device = get_device()
+    print(f"Device: {device}")
+    print()
+
+    _, val_loader, _ = get_imagenette(
+        batch_size=batch_size, data_dir=data_dir, num_workers=num_workers,
+    )
+    print(f"Val: {len(val_loader.dataset)} images")
+    print()
+
+    ckpt_dir = os.path.join("output", "imagenette_ckpt")
+
+    # Test HiT-offset
+    ckpt_path = os.path.join(ckpt_dir, "hit_offset_tiny_imagenette.pt")
+    if os.path.exists(ckpt_path):
+        torch.manual_seed(42)
+        model = HiTOffsetTiny(num_classes=NUM_CLASSES).to(device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        print(f"Loaded HiT-offset from {ckpt_path}")
+        print(f"  epoch={ckpt['epoch']}, best_val_acc={ckpt.get('best_val_acc', '?')}%")
+    else:
+        print(f"No checkpoint at {ckpt_path}")
+        return
+
+    print()
+    print("=" * 60)
+    print("Offset Ablation Test (Imagenette)")
+    print("=" * 60)
+
+    model.eval()
+    # Config: (name, use_offset)
+    configs = [
+        ("Full (offset + L4)", True),
+        ("L4 only (drop offset)", False),
+    ]
+
+    for config_name, use_offset in configs:
+        correct, total_count = 0, 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                B = images.size(0)
+
+                fine_patches = extract_pyramid_patches(images, [14], model.patch_size)
+
+                if use_offset:
+                    offset_patches = model._extract_offset_patches(images)
+                    all_patches = torch.cat([offset_patches, fine_patches], dim=1)
+                    x = model.patch_proj(all_patches)
+                    all_coords = torch.cat([model.offset_coords, model.fine_coords], dim=0)
+                    pe = model.pe(all_coords)
+                    x = x + pe.unsqueeze(0)
+                else:
+                    # L4 only: skip offset tokens
+                    x = model.patch_proj(fine_patches)
+                    pe = model.pe(model.fine_coords)
+                    x = x + pe.unsqueeze(0)
+
+                cls_tokens = model.cls_token.expand(B, -1, -1) + model.cls_pos
+                x = torch.cat([cls_tokens, x], dim=1)
+                x = model.pos_drop(x)
+                x = model.blocks(x)
+                x = model.norm(x)
+                logits = model.head(x[:, 0])
+
+                _, predicted = logits.max(1)
+                correct += predicted.eq(labels).sum().item()
+                total_count += labels.size(0)
+
+        acc = 100.0 * correct / total_count
+        n_tokens = 282 if use_offset else 197
+        print(f"  {config_name:30s} | tokens={n_tokens:4d} | val_acc={acc:.1f}%")
+
+    # Also test HiT-macro+offset if available
+    ckpt_path2 = os.path.join(ckpt_dir, "hit_macro_offset_tiny_imagenette.pt")
+    if os.path.exists(ckpt_path2):
+        torch.manual_seed(42)
+        model2 = HiTMacroOffsetTiny(num_classes=NUM_CLASSES).to(device)
+        ckpt2 = torch.load(ckpt_path2, map_location=device, weights_only=True)
+        model2.load_state_dict(ckpt2["model"])
+        print()
+        print(f"Loaded HiT-macro+offset from {ckpt_path2}")
+        print(f"  epoch={ckpt2['epoch']}, best_val_acc={ckpt2.get('best_val_acc', '?')}%")
+        print()
+
+        # Configs for macro+offset: full, L4+offset, L4+macro, L4 only
+        mo_configs = [
+            ("Full (macro+offset+L4)", True, True),
+            ("Offset+L4 (drop macro)", False, True),
+            ("Macro+L4 (drop offset)", True, False),
+            ("L4 only", False, False),
+        ]
+
+        model2.eval()
+        for config_name, use_macro, use_offset in mo_configs:
+            correct, total_count = 0, 0
+
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    B = images.size(0)
+
+                    fine_patches = extract_pyramid_patches(images, [14], model2.patch_size)
+                    x_fine = model2.patch_proj(fine_patches)
+
+                    parts = []
+                    coord_parts = []
+
+                    if use_macro:
+                        macro_patches = extract_pyramid_patches(
+                            images, model2.levels[:-1], model2.patch_size)
+                        x_macro = model2.patch_proj(macro_patches)
+                        parts.append(x_macro)
+                        coord_parts.append(model2.macro_coords)
+
+                    if use_offset:
+                        offset_patches = model2._extract_offset_patches(images)
+                        x_offset = model2.patch_proj(offset_patches)
+                        parts.append(x_offset)
+                        coord_parts.append(model2.offset_coords)
+
+                    parts.append(x_fine)
+                    coord_parts.append(model2.fine_coords)
+
+                    x = torch.cat(parts, dim=1)
+                    all_coords = torch.cat(coord_parts, dim=0)
+                    pe = model2.pe(all_coords)
+                    x = x + pe.unsqueeze(0)
+
+                    cls_tokens = model2.cls_token.expand(B, -1, -1) + model2.cls_pos
+                    x = torch.cat([cls_tokens, x], dim=1)
+                    x = model2.pos_drop(x)
+                    x = model2.blocks(x)
+                    x = model2.norm(x)
+                    logits = model2.head(x[:, 0])
+
+                    _, predicted = logits.max(1)
+                    correct += predicted.eq(labels).sum().item()
+                    total_count += labels.size(0)
+
+            acc = 100.0 * correct / total_count
+            n_tokens = 1 + (85 if use_macro else 0) + (85 if use_offset else 0) + 196
+            print(f"  {config_name:30s} | tokens={n_tokens:4d} | val_acc={acc:.1f}%")
+
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -824,10 +975,18 @@ if __name__ == "__main__":
                         help="Comma-separated: vit,hit,hit_micro,hit_random or 'all'")
     parser.add_argument("--ablation", action="store_true",
                         help="Run level ablation on trained HiT-macro checkpoint")
+    parser.add_argument("--offset_ablation", action="store_true",
+                        help="Run offset ablation: test offset/macro internalization")
     args = parser.parse_args()
 
     if args.ablation:
         run_ablation(
+            batch_size=args.batch_size,
+            data_dir=args.data_dir,
+            num_workers=args.num_workers,
+        )
+    elif args.offset_ablation:
+        run_offset_ablation(
             batch_size=args.batch_size,
             data_dir=args.data_dir,
             num_workers=args.num_workers,
