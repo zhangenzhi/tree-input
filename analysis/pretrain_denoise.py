@@ -88,13 +88,14 @@ class HiTDenoise(nn.Module):
     - Model predicts clean L4 patch pixels from noisy input + global context
     """
 
-    def __init__(self, levels=None, noise_std=0.3):
+    def __init__(self, levels=None, noise_std=0.3, use_macro=True):
         super().__init__()
         self.levels = levels or LEVELS
         self.total_patches = sum(n * n for n in self.levels)
         self.patch_size = PATCH_SIZE
         self.noise_std = noise_std
         self.fine_patches = 14 * 14  # 196
+        self.use_macro = use_macro
 
         vit = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10)
         self.embed_dim = vit.embed_dim  # 192
@@ -150,11 +151,15 @@ class HiTDenoise(nn.Module):
             noise = torch.randn_like(clean_pixels) * noise_std
             all_patches[:, l4_offset:, :] = all_patches[:, l4_offset:, :] + noise
 
-        # Project all patches
-        x = self.patch_proj(all_patches)
-
-        # Positional encoding
-        pe = self.pe(self.pyramid_coords)
+        if self.use_macro:
+            # Full pyramid: coarse (L0-L3) + noisy L4
+            x = self.patch_proj(all_patches)
+            pe = self.pe(self.pyramid_coords)
+        else:
+            # L4 only: no macro context
+            x = self.patch_proj(all_patches[:, l4_offset:, :])
+            fine_coords = self.pyramid_coords[l4_offset:]
+            pe = self.pe(fine_coords)
         x = x + pe.unsqueeze(0)
 
         # CLS token
@@ -167,7 +172,10 @@ class HiTDenoise(nn.Module):
         x = self.norm(x)
 
         # Denoise head on L4 tokens only
-        l4_features = x[:, self.l4_start:self.l4_end, :]  # [B, 196, embed_dim]
+        if self.use_macro:
+            l4_features = x[:, self.l4_start:self.l4_end, :]  # [B, 196, embed_dim]
+        else:
+            l4_features = x[:, 1:1 + self.fine_patches, :]  # [B, 196, embed_dim] (skip CLS)
         pred_pixels = self.denoise_head(l4_features)  # [B, 196, 3*P*P]
 
         return pred_pixels, clean_pixels
@@ -353,6 +361,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagenette"])
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--ckpt_dir", type=str, default=None)
+    parser.add_argument("--no_macro", action="store_true",
+                        help="Pretrain without macro context (L4 only)")
     args = parser.parse_args()
 
     if args.ckpt_dir is None:
@@ -367,8 +377,11 @@ def main():
     os.makedirs(fig_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
+    use_macro = not args.no_macro
+    macro_tag = "macro" if use_macro else "nomacro"
     suffix = f"_{args.dataset}" if args.dataset != "cifar10" else ""
-    log_path = os.path.join(fig_dir, f"pretrain_denoise{suffix}.log")
+    nomacro_suffix = f"_{macro_tag}" if args.no_macro else ""
+    log_path = os.path.join(fig_dir, f"pretrain_denoise{nomacro_suffix}{suffix}.log")
     log_file = open(log_path, "w")
 
     def log(msg):
@@ -379,24 +392,29 @@ def main():
     log(f"Dataset: {args.dataset}")
     log(f"Pretrain: {args.pretrain_epochs} epochs, noise_std={args.noise_std}")
     log(f"Finetune: {args.finetune_epochs} epochs")
+    log(f"Macro context: {'Yes (L0-L3)' if use_macro else 'No (L4 only)'}")
     log("")
 
-    num_classes = 10  # both CIFAR-10 and Imagenette have 10 classes
-    ds_tag = args.dataset  # "cifar10" or "imagenette"
+    num_classes = 10
+    ds_tag = args.dataset
 
     # ================================================================
     # Stage 1: Pretrain with denoising
     # ================================================================
     log("=" * 70)
-    log("Stage 1: Pretraining HiT-Denoise (macro-prefix + denoising)")
+    ctx = "macro-prefix" if use_macro else "L4-only"
+    log(f"Stage 1: Pretraining HiT-Denoise ({ctx} + denoising)")
     log("=" * 70)
 
-    pt_ckpt = os.path.join(args.ckpt_dir, f"hit_denoise_pretrained_{ds_tag}.pt")
+    if args.no_macro:
+        pt_ckpt = os.path.join(args.ckpt_dir, f"hit_denoise_nomacro_pretrained_{ds_tag}.pt")
+    else:
+        pt_ckpt = os.path.join(args.ckpt_dir, f"hit_denoise_pretrained_{ds_tag}.pt")
     # Fallback for old CIFAR-10 checkpoint without dataset tag
     pt_ckpt_legacy = os.path.join(args.ckpt_dir, "hit_denoise_pretrained.pt")
 
     torch.manual_seed(42)
-    pretrain_model = HiTDenoise(noise_std=args.noise_std).to(device)
+    pretrain_model = HiTDenoise(noise_std=args.noise_std, use_macro=use_macro).to(device)
     param_count = sum(p.numel() for p in pretrain_model.parameters())
     log(f"Parameters: {param_count:,}")
 
