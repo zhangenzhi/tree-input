@@ -473,31 +473,42 @@ Two pretraining approaches to maximize macro-prefix information internalization,
 
 #### Results (Imagenette, 196 tokens at inference)
 
-| Model | Decoder | Finetune tokens | val_acc | vs ViT |
-|-------|---------|----------------|---------|--------|
-| ViT-Tiny (from scratch) | — | 196 | 75.9% | — |
-| HiT-macro (L4-only inference) | — | 196 | 79.8% | +3.9% |
-| HiT-macro (full) | — | 282 | 80.3% | +4.4% |
-| HiT-denoise (pretrain→ft) | MLP | 196 | 80.3% | +4.4% |
-| HiT-MAE (pretrain→ft) | MLP | 196 | 79.4% | +3.5% |
-| HiT-DiffMAE v1 (pretrain→ft) | MLP | 196 | 79.4% | +3.5% |
-| **HiT-DiffMAE v2 (pretrain→ft)** | **Transformer (4L)** | **196** | **80.5%** | **+4.6%** |
-| HiT-DiffMAE v1 + offset ft | MLP | 282 | 80.9% | +5.0% |
-| HiT-DiffMAE v2 + offset ft | Transformer (4L) | 282 | 79.9% | +4.0% |
+#### Full results table
+
+| Model | Macro? | Decoder | Recon target | Finetune tokens | val_acc | vs ViT |
+|-------|--------|---------|-------------|----------------|---------|--------|
+| ViT-Tiny (from scratch) | — | — | — | 196 | 75.9% | — |
+| HiT-macro (L4-only inference) | — | — | — | 196 | 79.8% | +3.9% |
+| HiT-macro (full) | — | — | — | 282 | 80.3% | +4.4% |
+| Denoise | **No** | MLP | L4 (noisy) | 196 | 79.6% | +3.7% |
+| **Denoise** | **Yes** | **MLP** | **L4 (noisy)** | **196** | **80.3%** | **+4.4%** |
+| MAE | Yes | MLP | L4 (masked) | 196 | 79.4% | +3.5% |
+| DiffMAE v1 | Yes | MLP | offset | 196 | 79.4% | +3.5% |
+| DiffMAE v2 | **No** | Transformer | L4 (masked) | 196 | 79.1% | +3.2% |
+| DiffMAE v2 | Yes | Transformer | L4 (masked) | 196 | 79.6% | +3.7% |
+| **DiffMAE v2** | **Yes** | **Transformer** | **offset** | **196** | **80.5%** | **+4.6%** |
+| DiffMAE v1 + offset ft | Yes | MLP | offset | 282 | 80.9% | +5.0% |
+| DiffMAE v2 + offset ft | Yes | Transformer | offset | 282 | 79.9% | +4.0% |
 
 #### Findings
 
-**F1: Transformer decoder improves L4-only pretraining.**
-DiffMAE v2 (transformer decoder, 80.5%) > v1 (MLP, 79.4%). The separate decoder demands higher-quality encoder latents, confirming the DiffMAE paper's core insight. This is the best pretraining result at 196 tokens, slightly exceeding the macro information ceiling (80.3%).
+**F1: Macro contributes a consistent +0.5-0.7% across all pretraining methods.**
+Denoise: 80.3% (macro) vs 79.6% (no macro) = +0.7%. DiffMAE L4: 79.6% (macro) vs 79.1% (no macro) = +0.5%. Macro is not a reconstruction shortcut — it provides genuine structural conditioning that helps the encoder learn better features.
 
-**F2: Stronger decoder hurts offset finetune.**
-DiffMAE v2 + offset (79.9%) < v1 + offset (80.9%). The stronger decoder offloaded reconstruction work from the encoder, so the encoder learned *less* about cross-boundary features. When offset patches are directly available at finetune, the v1 encoder (which was forced to do more work itself) transfers better.
+**F2: Seeing all L4 positions (denoise) ≈ having macro context (MAE/DiffMAE).**
+No-macro denoise (79.6%, all 196 L4 visible) = DiffMAE with macro (79.6%, 49 L4 visible + 85 macro). Both provide spatial completeness: denoise through full L4 coverage, macro through global structure. They contribute equivalent information.
 
-**F3: Pretraining ceiling is ~80.5% for L4-only inference.**
-All pretraining methods converge to 79-80.5% with 196 tokens. The ceiling is set by the information available during pretraining (macro context), not by the training objective's difficulty.
+**F3: Transformer decoder improves L4-only pretraining, but stronger decoder hurts offset finetune.**
+DiffMAE v2 offset (80.5%) > v1 offset (79.4%) for L4-only inference — decoder pressure improves encoder latents. But DiffMAE v2 + offset finetune (79.9%) < v1 + offset finetune (80.9%) — stronger decoder offloads reconstruction work, reducing encoder's cross-boundary knowledge.
 
-**F4: Direct input of extra tokens (81.8%) definitively beats pretraining (~80.5%).**
-HiT-macro+offset from scratch (81.8%, 367 tokens) > any pretraining approach. The bottleneck is input information, not feature learning capability. Pretraining can internalize existing info but cannot create new info.
+**F4: Pretraining ceiling is ~80.5% for L4-only inference.**
+All methods converge to 79-80.5% at 196 tokens, regardless of objective (denoise, MAE, DiffMAE), decoder (MLP, Transformer), or reconstruction target (L4, offset). The ceiling matches the macro information content. Pretraining cannot create information beyond what's available during training.
+
+**F5: Direct input of extra tokens (81.8%) definitively beats pretraining (~80.5%).**
+HiT-macro+offset from scratch (81.8%, 367 tokens) > any pretraining approach. The bottleneck is **input information**, not feature learning capability. ViT's performance gap is caused by structural information loss in patch tokenization, not by insufficient training objectives.
+
+**F6: Original DiffMAE's marginal gain is confirmed.**
+DiffMAE (Wei et al., ICCV 2023) reports +0.3% over MAE on ImageNet. We observe +0.2% (DiffMAE v2 L4 with macro: 79.6% vs MAE: 79.4%). Diffusion pretraining's value for classification is inherently limited — its strength is in dense prediction tasks where fine-grained spatial features matter more.
 
 ### 4.9 Internalized Information Localization
 
@@ -604,7 +615,8 @@ DiffMAE pretraining (reconstruct offset → finetune L4 only) achieved only 80.5
 | `analysis/linear_probe.py` | Per-layer per-level linear probe for ViT and HiT | Done |
 | `analysis/micro_prefix_probe.py` | Micro/random/fixed prefix control + comparative probe | Done |
 | `analysis/convergence_imagenette.py` | Imagenette: ViT/HiT/micro/random/noise/offset/random-PE + ablation | Done |
-| `analysis/pretrain_denoise.py` | Two-stage: denoise pretrain + classification finetune | Done |
+| `analysis/pretrain_denoise.py` | Two-stage: denoise pretrain (±macro) + classification finetune | Done |
 | `analysis/pretrain_mae.py` | Two-stage: MAE pretrain (75% mask) + classification finetune | Done |
+| `analysis/pretrain_diffmae.py` | DiffMAE: diffusion decoder + macro/no-macro + offset/L4 recon | Done |
 | `analysis/attention_distance.py` | Layer-wise attention distance + level attention distribution | Pending |
 | `analysis/internalization.py` | Residual subspace analysis: where is internalized info encoded | Planned |
